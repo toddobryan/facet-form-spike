@@ -1,4 +1,7 @@
-use facet::{Facet, Field, Partial, Peek, ReflectError, ScalarType, Shape, Type, UserType};
+use facet::{
+    EnumType, Facet, Field, Partial, Peek, ReflectError, ScalarType, Shape, StructType, Type,
+    UserType,
+};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
 #[derive(Facet, Clone, Debug, PartialEq)]
@@ -110,17 +113,23 @@ impl<T: Clone + Debug + PartialEq + Facet<'static>> Form<T> {
     }
 }
 
-/// Build a form by walking `T`'s shape.
-///
-/// `None` is create mode: every field starts genuinely `Empty`, with no
-/// reference to `T::default()` at all. `Some(t)` is edit mode: each field is
-/// seeded from `t`'s corresponding value. Required-vs-optional comes from the
-/// model itself — a field declared `Option<X>` is optional, anything else is
-/// required.
-pub fn form_for<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<T>) -> Form<T> {
-    Form {
+pub fn form_for<T: Clone + Debug + PartialEq + Facet<'static>>(value: &T) -> Form<T> {
+    form_for_impl(Some(value), &HashMap::new())
+}
+
+pub fn empty_form<T: Clone + Debug + PartialEq + Facet<'static>>() -> Form<T> {
+    form_for_impl(None, &HashMap::new())
+}
+
+pub fn empty_form_with_variants<T: Clone + Debug + PartialEq + Facet<'static>>(variants: &HashMap<String, Vec<String>>) -> Form<T> {
+    form_for_impl(None, variants)
+}
+
+fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<&T>, variants: &HashMap<String, Vec<String>>) -> Form<T> {
+    assert!(value.is_some() == variants.is_empty(), "should be impossible to have Some with non-empty variants");
+     Form {
         title: None,
-        members: members_for(T::SHAPE, value.as_ref().map(Peek::new)),
+        members: members_for(T::SHAPE, value.map(Peek::new), variants, ""),
         errors: Vec::new(),
         _type: PhantomData,
     }
@@ -128,10 +137,27 @@ pub fn form_for<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<T>)
 
 /// One member per declared field of `shape`. `peek` is the value being seeded
 /// from, if any — it must describe the same shape.
-fn members_for(shape: &'static Shape, peek: Option<Peek<'_, 'static>>) -> Vec<Box<dyn FormMember>> {
-    let Type::User(UserType::Struct(struct_type)) = &shape.ty else {
-        panic!("form_for only handles structs so far, got {shape}");
-    };
+fn members_for(
+    shape: &'static Shape,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, Vec<String>>,
+    prefix: &str,
+) -> Vec<Box<dyn FormMember>> {
+    match &shape.ty {
+        Type::User(UserType::Struct(struct_type)) => fields_from_struct(struct_type, peek, variants, prefix),
+        Type::User(UserType::Enum(enum_type)) => {
+            fields_from_enum(enum_type, peek, variants, prefix)
+        }
+        _ => panic!("form_for only handles structs and enums, got {shape}"),
+    }
+}
+
+fn fields_from_struct(
+    struct_type: &StructType,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, Vec<String>>,
+    prefix: &str,
+) -> Vec<Box<dyn FormMember>> {
     let peek_struct = peek.map(|p| {
         p.into_struct()
             .expect("shape said struct, so the value peeks as one")
@@ -145,12 +171,31 @@ fn members_for(shape: &'static Shape, peek: Option<Peek<'_, 'static>>) -> Vec<Bo
                 ps.field_by_name(field.name)
                     .expect("field came from this shape, so it exists on the value")
             });
-            member_for(field, field_peek)
+            member_for(field, field_peek, variants, prefix)
         })
         .collect()
 }
 
-fn member_for(field: &'static Field, peek: Option<Peek<'_, 'static>>) -> Box<dyn FormMember> {
+fn fields_from_enum(
+    enum_type: &EnumType,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, Vec<String>>,
+    prefix: &str,
+) -> Vec<Box<dyn FormMember>> {
+    let peek_enum = peek.map(|p| {
+        p.into_enum()
+            .expect("shape said enum, so the value peeks as one");
+    });
+
+    todo!()
+}
+
+fn member_for(
+    field: &'static Field,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, Vec<String>>,
+    prefix: &str,
+) -> Box<dyn FormMember> {
     // `Option<X>` means optional, and `X` — not `Option<X>` — is what the
     // widget and the seeded value are actually about.
     let (required, inner_shape) = match field.shape().def.into_option() {
@@ -184,11 +229,38 @@ fn member_for(field: &'static Field, peek: Option<Peek<'_, 'static>>) -> Box<dyn
         Type::User(UserType::Struct(_)) => Box::new(FieldSet {
             name: field.name.to_string(),
             label: None,
-            members: members_for(inner_shape, inner_peek),
+            members: members_for(inner_shape, inner_peek, variants, prefix),
             errors: Vec::new(),
         }),
         other => panic!("field {} has unsupported type {other:?}", field.name),
     }
+}
+/// A map from each enum field's qualified path to that enum's variant names.
+fn required_variants<T: Facet<'static>>() -> HashMap<String, Vec<String>> {
+    // Out-param, not a threaded return: recursion just mutates `out` in place,
+    // so there's no borrow to pass back and forth.
+    fn walk(out: &mut HashMap<String, Vec<String>>, s: &'static Shape, prefix: &str) {
+        match &s.ty {
+            Type::User(UserType::Struct(st)) => {
+                for f in st.fields.iter() {
+                    walk(out, f.shape(), &qualify(prefix, f.name));
+                }
+            }
+            Type::User(UserType::Enum(et)) => {
+                out.insert(
+                    prefix.to_string(),
+                    et.variants.iter().map(|v| v.name.to_string()).collect(),
+                );
+            }
+            // Scalars, Option, List, … — nothing to choose, just skip. (Whether to
+            // descend through Option/into variants is one of the open questions.)
+            _ => {}
+        }
+    }
+
+    let mut out = HashMap::new();
+    walk(&mut out, T::SHAPE, "");
+    out
 }
 
 /// The closed set of scalar types with a built-in widget. Anything else needs
@@ -549,7 +621,7 @@ mod tests {
 
     #[test]
     fn repeated_struct_types_get_distinct_paths() {
-        let form = form_for::<Trip>(None);
+        let form = empty_form::<Trip>();
         let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
 
         assert_eq!(
@@ -567,7 +639,7 @@ mod tests {
 
     #[test]
     fn form_for_none_walks_the_shape_into_empty_members() {
-        let form = form_for::<EventForCreate>(None);
+        let form = empty_form::<EventForCreate>();
 
         assert_eq!(member_names(&form.members), vec!["title", "location"]);
 
@@ -586,7 +658,7 @@ mod tests {
 
     #[test]
     fn form_for_none_is_invalid_until_filled() {
-        let mut form = form_for::<EventForCreate>(None);
+        let mut form = empty_form::<EventForCreate>();
         assert_eq!(form.validate(), None);
         assert!(form.has_errors());
     }
@@ -602,14 +674,14 @@ mod tests {
             },
         };
 
-        let mut form = form_for(Some(event.clone()));
+        let mut form = form_for(&event);
         assert!(!form.has_errors());
         assert_eq!(form.validate(), Some(event));
     }
 
     #[test]
     fn option_fields_are_not_required() {
-        let mut form = form_for::<Rsvp>(None);
+        let mut form = empty_form::<Rsvp>();
 
         // `note: Option<String>` is optional, so an empty form only complains
         // about `name` and `guests`.
@@ -633,7 +705,7 @@ mod tests {
             note: Some("bringing dessert".to_string()),
         };
         assert_eq!(
-            form_for(Some(with_note.clone())).validate(),
+            form_for(&with_note).validate(),
             Some(with_note)
         );
 
@@ -643,7 +715,7 @@ mod tests {
             note: None,
         };
         assert_eq!(
-            form_for(Some(without_note.clone())).validate(),
+            form_for(&without_note).validate(),
             Some(without_note)
         );
     }
@@ -659,7 +731,7 @@ mod tests {
     fn applying_widget_values_round_trips_to_a_model() {
         // The full loop: shape-walk an empty form, take raw strings back in
         // the way a submit handler would, then validate into a model.
-        let mut form = form_for::<EventForCreate>(None);
+        let mut form = empty_form::<EventForCreate>();
         form.apply(&values(&[
             ("title", "Board Game Night"),
             ("location.street", "123 Main St"),
@@ -683,7 +755,7 @@ mod tests {
     #[test]
     fn non_string_scalars_parse_through_the_shape_vtable() {
         // `u32` here never touches `FromStr` — facet parses it from the shape.
-        let mut form = form_for::<Rsvp>(None);
+        let mut form = empty_form::<Rsvp>();
         form.apply(&values(&[
             ("name", "Ada"),
             ("guests", "2"),
@@ -702,7 +774,7 @@ mod tests {
 
     #[test]
     fn unparseable_input_becomes_invalid_not_a_panic() {
-        let mut form = form_for::<Rsvp>(None);
+        let mut form = empty_form::<Rsvp>();
         form.apply(&values(&[("name", "Ada"), ("guests", "not a number")]));
 
         assert_eq!(form.validate(), None);
@@ -719,11 +791,11 @@ mod tests {
 
     #[test]
     fn blanking_a_field_makes_it_empty_again() {
-        let mut form = form_for(Some(Rsvp {
+        let mut form = form_for(&Rsvp {
             name: "Ada".to_string(),
             guests: 2,
             note: Some("bringing dessert".to_string()),
-        }));
+        });
         // Clearing an optional field is legal; clearing a required one isn't.
         form.apply(&values(&[("note", ""), ("name", "")]));
 
@@ -748,10 +820,10 @@ mod tests {
             note: Some("bringing dessert".to_string()),
         };
 
-        let form = form_for(Some(rsvp.clone()));
+        let form = form_for(&rsvp);
         let round_tripped: HashMap<String, String> = form.leaves().into_iter().collect();
 
-        let mut reloaded = form_for::<Rsvp>(None);
+        let mut reloaded = empty_form::<Rsvp>();
         reloaded.apply(&round_tripped);
 
         assert_eq!(reloaded.validate(), Some(rsvp));
@@ -858,14 +930,14 @@ mod widget_tests {
     #[component]
     fn EventFormView() -> Element {
         let form = use_hook(|| {
-            form_for(Some(EventForCreate {
+            form_for(&EventForCreate {
                 title: "Board Game Night".to_string(),
                 location: ModelLocation {
                     street: "123 Main St".to_string(),
                     city: "Springfield".to_string(),
                     zip: "12345".to_string(),
                 },
-            }))
+            })
         });
         let signals = use_field_signals(&form);
 
@@ -891,7 +963,7 @@ mod widget_tests {
     /// hands the whole form back and we shuffle it into a `Form<T>` once.
     #[component]
     fn UncontrolledEventForm() -> Element {
-        let form = use_hook(|| form_for::<EventForCreate>(None));
+        let form = use_hook(|| empty_form::<EventForCreate>());
         let leaves = form.leaves();
 
         rsx! {
@@ -907,7 +979,7 @@ mod widget_tests {
                             FormValue::File(_) => None,
                         })
                         .collect();
-                    let mut form = form_for::<EventForCreate>(None);
+                    let mut form = empty_form::<EventForCreate>();
                     form.apply_form_values(&values);
                     let _model = form.validate();
                 },
@@ -942,7 +1014,7 @@ mod widget_tests {
             ("location.zip".to_string(), "12345".to_string()),
         ];
 
-        let mut form = form_for::<EventForCreate>(None);
+        let mut form = empty_form::<EventForCreate>();
         form.apply_form_values(&submitted);
 
         assert_eq!(
