@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dioxus = "0.7.9"
+dioxus-ssr = "0.7"
 facet = { version = "0.46.5", features = ["reflect"] }
