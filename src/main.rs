@@ -1,6 +1,6 @@
 use facet::{
-    EnumType, Facet, Field, Partial, Peek, ReflectError, ScalarType, Shape, StructType, Type,
-    UserType,
+    EnumType, Facet, Field, Partial, Peek, PeekEnum, ReflectError, ScalarType, Shape, StructType,
+    Type, UserType, Variant,
 };
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
@@ -121,11 +121,11 @@ pub fn empty_form<T: Clone + Debug + PartialEq + Facet<'static>>() -> Form<T> {
     form_for_impl(None, &HashMap::new())
 }
 
-pub fn empty_form_with_variants<T: Clone + Debug + PartialEq + Facet<'static>>(variants: &HashMap<String, Vec<String>>) -> Form<T> {
+pub fn empty_form_with_variants<T: Clone + Debug + PartialEq + Facet<'static>>(variants: &HashMap<String, String>) -> Form<T> {
     form_for_impl(None, variants)
 }
 
-fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<&T>, variants: &HashMap<String, Vec<String>>) -> Form<T> {
+fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<&T>, variants: &HashMap<String, String>) -> Form<T> {
     assert!(
         value.is_none() || variants.is_empty(),
         "should be impossible to have Some with non-empty variants"
@@ -143,7 +143,7 @@ fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<&T
 fn members_for(
     shape: &'static Shape,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, Vec<String>>,
+    variants: &HashMap<String, String>,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     match &shape.ty {
@@ -158,7 +158,7 @@ fn members_for(
 fn fields_from_struct(
     struct_type: &StructType,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, Vec<String>>,
+    variants: &HashMap<String, String>,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     let peek_struct = peek.map(|p| {
@@ -174,29 +174,84 @@ fn fields_from_struct(
                 ps.field_by_name(field.name)
                     .expect("field came from this shape, so it exists on the value")
             });
-            member_for(field, field_peek, variants, prefix)
+            member_for(field, field_peek, variants, &qualify(prefix, field.name))
         })
         .collect()
 }
 
+/// The variant to build for an enum shape. Edit mode reads it off the value
+/// (the value pins it); create mode takes it from the caller's chosen-variant
+/// map, keyed by this enum's qualified path. Shared by the top-level
+/// `fields_from_enum` and `member_for`'s enum-field arm (which also needs the
+/// variant's *name*), so the selection logic lives in exactly one place.
+fn chosen_variant(
+    enum_type: &EnumType,
+    peek_enum: Option<PeekEnum<'_, 'static>>,
+    variants: &HashMap<String, String>,
+    prefix: &str,
+) -> &'static Variant {
+    let variant_name: String = match peek_enum {
+        Some(pe) => pe
+            .variant_name_active()
+            .expect("an enum value always has an active variant")
+            .to_string(),
+        None => variants
+            .get(prefix)
+            .unwrap_or_else(|| panic!("no variant chosen for the enum at {prefix:?}"))
+            .clone(),
+    };
+    enum_type
+        .variants
+        .iter()
+        .find(|v| v.name == variant_name)
+        .unwrap_or_else(|| panic!("{variant_name:?} is not a variant of this enum"))
+}
+
+/// One member per field of the chosen `variant`, seeded from that variant's
+/// fields on the value in edit mode. Paths accumulate under this enum's path
+/// just like a struct's fields — the variant name is NOT part of the path
+/// (it's locked; `write_into` replays it via `select_variant_named`).
+fn variant_members(
+    variant: &'static Variant,
+    peek_enum: Option<PeekEnum<'_, 'static>>,
+    variants: &HashMap<String, String>,
+    prefix: &str,
+) -> Vec<Box<dyn FormMember>> {
+    variant
+        .data
+        .fields
+        .iter()
+        .map(|field| {
+            let field_peek = peek_enum.and_then(|pe| {
+                pe.field_by_name(field.name)
+                    .expect("field belongs to the active variant, so access can't error")
+            });
+            member_for(field, field_peek, variants, &qualify(prefix, field.name))
+        })
+        .collect()
+}
+
+/// Members for a top-level enum model (the whole `Form<T>` is an enum). Enum
+/// *fields* don't come through here — `member_for` builds a `VariantSet` for
+/// those; this is only the `members_for` dispatch for a bare-enum `T`.
 fn fields_from_enum(
     enum_type: &EnumType,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, Vec<String>>,
+    variants: &HashMap<String, String>,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     let peek_enum = peek.map(|p| {
         p.into_enum()
             .expect("shape said enum, so the value peeks as one")
     });
-
-    todo!()
+    let variant = chosen_variant(enum_type, peek_enum, variants, prefix);
+    variant_members(variant, peek_enum, variants, prefix)
 }
 
 fn member_for(
     field: &'static Field,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, Vec<String>>,
+    variants: &HashMap<String, String>,
     prefix: &str,
 ) -> Box<dyn FormMember> {
     // `Option<X>` means optional, and `X` — not `Option<X>` — is what the
@@ -235,6 +290,20 @@ fn member_for(
             members: members_for(inner_shape, inner_peek, variants, prefix),
             errors: Vec::new(),
         }),
+        Type::User(UserType::Enum(enum_type)) => {
+            let peek_enum = inner_peek.map(|p| {
+                p.into_enum()
+                    .expect("shape said enum, so the value peeks as one")
+            });
+            let variant = chosen_variant(enum_type, peek_enum, variants, prefix);
+            Box::new(VariantSet {
+                name: field.name.to_string(),
+                label: None,
+                variant: variant.name.to_string(),
+                members: variant_members(variant, peek_enum, variants, prefix),
+                errors: Vec::new(),
+            })
+        }
         other => panic!("field {} has unsupported type {other:?}", field.name),
     }
 }
@@ -417,6 +486,83 @@ impl FormMember for FieldSet {
 
     fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
         let mut partial = partial.begin_field(&self.name)?;
+        for m in self.members.iter() {
+            partial = m.write_into(partial)?;
+        }
+        partial.end()
+    }
+}
+
+/// An enum-typed field, locked to one variant chosen before the form (per the
+/// design — variant choice is a construction parameter, not an editable field).
+/// It's a `FieldSet` over the chosen variant's fields, plus the variant name so
+/// `write_into` can replay the choice. The variant is NOT a leaf — it never
+/// appears in a path or an input.
+#[derive(Clone, Debug)]
+pub struct VariantSet {
+    pub name: String,
+    pub label: Option<String>,
+    pub variant: String,
+    pub members: Vec<Box<dyn FormMember>>,
+    pub errors: Vec<FormError>,
+}
+
+impl FormMember for VariantSet {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    fn render(&self) -> String {
+        self.members
+            .iter()
+            .map(|m| m.render())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    fn validate(&mut self) {
+        self.errors.clear();
+        for m in self.members.iter_mut() {
+            m.validate();
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn FormMember> {
+        Box::new(self.clone())
+    }
+
+    fn has_errors(&self) -> bool {
+        !self.errors.is_empty() || self.members.iter().any(|m| m.has_errors())
+    }
+
+    fn raw_value(&self) -> String {
+        // Not a scalar — the chosen variant is fixed, not an input of its own.
+        String::new()
+    }
+
+    fn collect_leaves(&self, prefix: &str, out: &mut Vec<(String, String)>) {
+        let nested = qualify(prefix, &self.name);
+        for m in self.members.iter() {
+            m.collect_leaves(&nested, out);
+        }
+    }
+
+    fn apply_leaves(&mut self, prefix: &str, values: &HashMap<String, String>) {
+        let nested = qualify(prefix, &self.name);
+        for m in self.members.iter_mut() {
+            m.apply_leaves(&nested, values);
+        }
+    }
+
+    fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
+        let mut partial = partial.begin_field(&self.name)?;
+        // The one thing a plain field set doesn't do: lock in the variant before
+        // writing its fields, so `Partial::build` materializes the right one.
+        partial = partial.select_variant_named(&self.variant)?;
         for m in self.members.iter() {
             partial = m.write_into(partial)?;
         }
@@ -1068,7 +1214,7 @@ mod widget_tests {
 }
 
 #[cfg(test)]
-mod required_variants_tests {
+mod enum_tests {
     use super::*;
 
     // Vec-free enums, per the agreed first target — isolates the enum work from
@@ -1152,6 +1298,63 @@ mod required_variants_tests {
             required_variants::<Outer>(),
             variants(&[("drawing.shape", &["Circle", "Rectangle"])]),
         );
+    }
+
+    // ── Construction: the enum field actually round-trips through validate() ──
+
+    // Create mode: the caller picks the variant, the chosen variant's fields
+    // become leaves under the enum's path, and validate() builds that variant.
+    #[test]
+    fn empty_form_with_variants_builds_and_validates_the_chosen_variant() {
+        let chosen = HashMap::from([("shape".to_string(), "Circle".to_string())]);
+        let mut form = empty_form_with_variants::<Drawing>(&chosen);
+
+        // Only the chosen variant's field is present, keyed under `shape`.
+        let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
+        assert!(paths.contains(&"name".to_string()), "paths: {paths:?}");
+        assert!(paths.contains(&"shape.radius".to_string()), "paths: {paths:?}");
+
+        form.apply_form_values(&[
+            ("name".to_string(), "My Drawing".to_string()),
+            ("shape.radius".to_string(), "3.5".to_string()),
+        ]);
+        assert_eq!(
+            form.validate(),
+            Some(Drawing {
+                name: "My Drawing".to_string(),
+                shape: Shape::Circle { radius: 3.5 },
+            }),
+        );
+    }
+
+    // Edit mode: the value pins the variant (no map needed) and seeds its
+    // fields; validate() replays the same variant via select_variant_named.
+    #[test]
+    fn form_for_round_trips_an_enum_field() {
+        let drawing = Drawing {
+            name: "Rect".to_string(),
+            shape: Shape::Rectangle {
+                width: 2.0,
+                height: 4.0,
+            },
+        };
+        let mut form = form_for(&drawing);
+        assert_eq!(form.validate(), Some(drawing));
+    }
+
+    // The enum lives one struct deep — exercises the qualified path
+    // (`drawing.shape.…`) through both construction and write_into.
+    #[test]
+    fn nested_enum_field_round_trips() {
+        let outer = Outer {
+            title: "T".to_string(),
+            drawing: Drawing {
+                name: "N".to_string(),
+                shape: Shape::Circle { radius: 1.0 },
+            },
+        };
+        let mut form = form_for(&outer);
+        assert_eq!(form.validate(), Some(outer));
     }
 
     // OPEN QUESTIONS — deliberately not asserted, because the behavior isn't
