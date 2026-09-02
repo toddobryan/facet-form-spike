@@ -126,7 +126,10 @@ pub fn empty_form_with_variants<T: Clone + Debug + PartialEq + Facet<'static>>(v
 }
 
 fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<&T>, variants: &HashMap<String, Vec<String>>) -> Form<T> {
-    assert!(value.is_some() == variants.is_empty(), "should be impossible to have Some with non-empty variants");
+    assert!(
+        value.is_none() || variants.is_empty(),
+        "should be impossible to have Some with non-empty variants"
+    );
      Form {
         title: None,
         members: members_for(T::SHAPE, value.map(Peek::new), variants, ""),
@@ -184,7 +187,7 @@ fn fields_from_enum(
 ) -> Vec<Box<dyn FormMember>> {
     let peek_enum = peek.map(|p| {
         p.into_enum()
-            .expect("shape said enum, so the value peeks as one");
+            .expect("shape said enum, so the value peeks as one")
     });
 
     todo!()
@@ -1062,4 +1065,103 @@ mod widget_tests {
             "expected the seeded street in:\n{html}"
         );
     }
+}
+
+#[cfg(test)]
+mod required_variants_tests {
+    use super::*;
+
+    // Vec-free enums, per the agreed first target — isolates the enum work from
+    // the still-unproven `Vec`/`Def::List` handling. `#[repr(u8)]` is required
+    // for facet to derive on an enum (it needs the discriminant repr).
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    #[repr(u8)]
+    pub enum Shape {
+        Circle { radius: f64 },
+        Rectangle { width: f64, height: f64 },
+    }
+
+    // Unit variants — to prove they still enumerate even with no fields.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    #[repr(u8)]
+    pub enum Mode {
+        Fast,
+        Slow,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct Drawing {
+        pub name: String,
+        pub shape: Shape,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct Config {
+        pub shape: Shape,
+        pub mode: Mode,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct Outer {
+        pub title: String,
+        pub drawing: Drawing,
+    }
+
+    fn variants(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(path, vs)| (path.to_string(), vs.iter().map(|v| v.to_string()).collect()))
+            .collect()
+    }
+
+    // A struct with no enum fields anywhere has nothing to choose — the empty
+    // map is exactly what makes `empty_form::<T>()` safe for such a `T`.
+    #[test]
+    fn no_enum_fields_yields_empty_map() {
+        assert_eq!(required_variants::<Location>(), HashMap::new());
+    }
+
+    // One enum field: keyed by the field name, listing that enum's variants in
+    // declaration order (Circle before Rectangle).
+    #[test]
+    fn single_enum_field_lists_its_variants_in_declaration_order() {
+        assert_eq!(
+            required_variants::<Drawing>(),
+            variants(&[("shape", &["Circle", "Rectangle"])]),
+        );
+    }
+
+    // Two enum fields → two entries; `mode`'s unit variants still enumerate.
+    #[test]
+    fn multiple_enum_fields_including_unit_variants() {
+        assert_eq!(
+            required_variants::<Config>(),
+            variants(&[
+                ("shape", &["Circle", "Rectangle"]),
+                ("mode", &["Fast", "Slow"]),
+            ]),
+        );
+    }
+
+    // An enum nested under a struct field is keyed by its qualified path —
+    // `drawing.shape`, never `shape` — the same field-name qualification
+    // `collect_leaves` uses, so two nested enums can't collide.
+    #[test]
+    fn nested_enum_field_is_qualified_by_path() {
+        assert_eq!(
+            required_variants::<Outer>(),
+            variants(&[("drawing.shape", &["Circle", "Rectangle"])]),
+        );
+    }
+
+    // OPEN QUESTIONS — deliberately not asserted, because the behavior isn't
+    // decided yet. Flagging so we choose on purpose rather than by accident:
+    //
+    //   1. `Option<SomeEnum>` field — is it in the map (needs a variant IF
+    //      present) or omitted (absence is a legal, choice-free state)?
+    //   2. A top-level enum `T` itself (`required_variants::<Shape>()`) — what's
+    //      the key, `""`? Or is a bare-enum model simply out of scope?
+    //   3. An enum nested *inside a variant's* fields — does the walk recurse
+    //      through variants, and if so what are those paths (they only exist
+    //      once a parent variant is chosen)?
 }
