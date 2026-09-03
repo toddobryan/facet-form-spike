@@ -1477,6 +1477,27 @@ mod enum_tests {
         pub drawing: Drawing,
     }
 
+    // An enum reachable only *through* another enum's variant — the shape that
+    // makes variant discovery iterative rather than one-shot.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    #[repr(u8)]
+    pub enum Inner {
+        A { x: f64 },
+        B { y: f64 },
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    #[repr(u8)]
+    pub enum Outer2 {
+        First { inner: Inner },
+        Second { n: u32 },
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct Doc {
+        pub outer: Outer2,
+    }
+
     /// An enum behind an `Option` — the case nothing covered until now.
     #[derive(Facet, Clone, Debug, PartialEq)]
     pub struct Sketch {
@@ -1687,6 +1708,77 @@ mod enum_tests {
         let html = form_for(&sketch).render();
         assert!(html.contains(ABSENT_DISPLAY), "html: {html}");
         assert!(html.contains("disabled"), "html: {html}");
+    }
+
+    // ── Iterative disclosure: choices reveal further choices ──
+
+    // The whole loop in one test. `outer.inner` does not exist as a question
+    // until `outer` is answered with the variant that contains it — which is
+    // why a single up-front walk could never have found it.
+    #[test]
+    fn choosing_a_variant_reveals_the_enums_inside_it() {
+        // Nothing chosen: only the outer enum is reachable.
+        assert_eq!(
+            missing_variants::<Doc>(&chose(&[])),
+            variants(&[("outer", &["First", "Second"])]),
+            "outer.inner must be invisible before outer is answered",
+        );
+
+        // Answering `outer` with the variant that holds an enum reveals it.
+        assert_eq!(
+            missing_variants::<Doc>(&chose(&[("outer", named("First"))])),
+            variants(&[("outer.inner", &["A", "B"])]),
+        );
+
+        // The other branch holds no enum, so answering it finishes the loop.
+        assert_eq!(
+            missing_variants::<Doc>(&chose(&[("outer", named("Second"))])),
+            HashMap::new(),
+        );
+
+        // Answering the revealed question finishes the first branch too.
+        assert_eq!(
+            missing_variants::<Doc>(&chose(&[
+                ("outer", named("First")),
+                ("outer.inner", named("A")),
+            ])),
+            HashMap::new(),
+        );
+    }
+
+    // The two walks agree: once `missing_variants` is empty, construction
+    // succeeds — that's the invariant keeping the `Result` from lying.
+    #[test]
+    fn a_fully_answered_nested_enum_builds_and_round_trips() {
+        let chosen = chose(&[("outer", named("First")), ("outer.inner", named("A"))]);
+        assert_eq!(missing_variants::<Doc>(&chosen), HashMap::new());
+
+        let mut form =
+            empty_form_with_variants::<Doc>(&chosen).expect("every reachable enum is answered");
+
+        // The doubly-nested leaf is qualified the whole way down.
+        let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["outer.inner.x"]);
+
+        form.apply_form_values(&[("outer.inner.x".to_string(), "1.25".to_string())]);
+        assert_eq!(
+            form.validate(),
+            Some(Doc {
+                outer: Outer2::First {
+                    inner: Inner::A { x: 1.25 },
+                },
+            }),
+        );
+    }
+
+    // Partial answers stay errors, and the error names what is still open —
+    // which is what a caller renders as the next round of pickers.
+    #[test]
+    fn a_half_answered_nested_enum_reports_only_what_is_still_open() {
+        let chosen = chose(&[("outer", named("First"))]);
+        let err = empty_form_with_variants::<Doc>(&chosen)
+            .expect_err("outer.inner is revealed but unanswered");
+        assert_eq!(err.0, variants(&[("outer.inner", &["A", "B"])]));
     }
 
     // ── Construction: the enum field actually round-trips through validate() ──
