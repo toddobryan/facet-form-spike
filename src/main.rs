@@ -2074,11 +2074,6 @@ mod vec_tests {
         shapes: Vec<Shape>,
     }
 
-    #[derive(Facet, Clone, Debug, PartialEq)]
-    struct Tagged {
-        tags: Option<Vec<String>>,
-    }
-
     fn quiz() -> Quiz {
         Quiz {
             title: "Unit 1".to_string(),
@@ -2246,18 +2241,270 @@ mod vec_tests {
             })
         );
     }
+}
+
+/// `Option` composes with every member kind — it is not a fifth kind of its own.
+///
+/// Scalars and enums behind an `Option` already work; **structs and lists do
+/// not**, in either direction. `Some(v)` panics (`begin_field` lands on the
+/// `Option` slot, so the inner `begin_field`/`init_list` hits `Option`'s own
+/// enum shape), and `None` fails *silently* — `validate()` just returns `None`,
+/// because the inner fields are required and `Empty`, so an absent optional
+/// container is currently unrepresentable.
+///
+/// These are the RED target for `option_member`/`OptionalMember`: peel ONE
+/// `Option` layer in `member_for_shape` and recurse (the recursion IS the
+/// dispatch), wrapping the result in a decorator that owns the
+/// `begin_some`/`set_default` frame AND intercepts `validate` — absent means
+/// don't validate the inner, which is what unwinds `FormField::required`'s
+/// double duty.
+///
+/// They are `#[ignore]d` so the suite stays green while that lands; run them
+/// with `cargo test -- --ignored` and delete each attribute as it passes.
+/// `an_absent_optional_struct_still_offers_its_leaves` is deliberately NOT
+/// ignored: it passes today and must keep passing.
+///
+/// Optional *enums* stay covered by `enum_tests` (`edit_mode_round_trips_an_
+/// optional_enum`, `create_mode_absent_builds_a_none`, …). Those are the
+/// regression guard for retiring `VariantSet::optional`, which `OptionalMember`
+/// is meant to subsume.
+#[cfg(test)]
+mod optional_container_tests {
+    use super::tests::Location;
+    use super::*;
+
+    /// `Option<Struct>` — the case that panics one way and lies the other.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Contact {
+        name: String,
+        address: Option<Location>,
+    }
+
+    /// `Option<Vec<Scalar>>`. Moved here from `vec_tests`, where it was the
+    /// lone ignored list test — it isn't a list bug, it's this one.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Tagged {
+        tags: Option<Vec<String>>,
+    }
+
+    /// `Option<Vec<Struct>>` — the write path has to compose `begin_some` →
+    /// `init_list` → `begin_list_item` → `begin_field`, one frame per layer.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Roster {
+        members: Option<Vec<Location>>,
+    }
+
+    /// `Option<Vec<Option<Scalar>>>` — two `Option`s at different depths, which
+    /// is exactly what "peel one layer per recursion" buys and what the current
+    /// single up-front unwrap can never reach.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Matrix {
+        cells: Option<Vec<Option<String>>>,
+    }
+
+    fn springfield() -> Location {
+        Location {
+            street: "123 Main St".to_string(),
+            city: "Springfield".to_string(),
+            zip: "12345".to_string(),
+        }
+    }
+
+    fn contact(address: Option<Location>) -> Contact {
+        Contact {
+            name: "Ada".to_string(),
+            address,
+        }
+    }
+
+    fn applied(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(p, v)| (p.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn paths<T: Clone + Debug + PartialEq + Facet<'static>>(form: &Form<T>) -> Vec<String> {
+        form.leaves().into_iter().map(|(p, _)| p).collect()
+    }
+
+    // ── Shape of the form ──
 
     #[test]
-    #[ignore = "known gap: Option<Vec<T>> needs a begin_some frame, like VariantSet's"]
-    fn optional_lists_round_trip() {
-        // `begin_field` lands on the `Option` slot, so `init_list` is called on
-        // `Option<Vec<String>>` and facet rejects it — the exact shape of the
-        // bug `Option<Enum>` had before `VariantSet` grew its `optional` flag.
-        let tagged = Tagged {
+    fn an_absent_optional_struct_still_offers_its_leaves() {
+        // Passes today, and the decorator must not break it: an absent optional
+        // struct still renders its inner inputs, empty. If it hid them there
+        // would be no way to *fill one in* — presence is derived from what the
+        // user types, so the inputs have to be there to type into.
+        //
+        // Also pins that `Option` contributes no path segment of its own:
+        // `address.street`, never `address.some.street`.
+        let form = form_for(&contact(None));
+        assert_eq!(
+            paths(&form),
+            vec!["name", "address.street", "address.city", "address.zip"],
+        );
+        assert_eq!(
+            form.leaves(),
+            vec![
+                ("name".to_string(), "Ada".to_string()),
+                ("address.street".to_string(), String::new()),
+                ("address.city".to_string(), String::new()),
+                ("address.zip".to_string(), String::new()),
+            ],
+        );
+    }
+
+    // ── Option<Struct> ──
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember — panics today, `must select variant before selecting enum fields`"]
+    fn a_present_optional_struct_round_trips() {
+        let value = contact(Some(springfield()));
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
+    }
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember — the silent failure, returns None today"]
+    fn an_absent_optional_struct_round_trips() {
+        // The dangerous one. No panic today: the inner fields are required and
+        // `Empty`, so `validate()` reports errors and hands back `None` — an
+        // absent optional struct simply cannot be expressed. The wrapper has to
+        // intercept `validate`, not just the write path.
+        let value = contact(None);
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
+    }
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember"]
+    fn create_mode_leaves_an_untouched_optional_struct_absent() {
+        // Same rule arriving through the DOM path rather than through seeding —
+        // the two boundaries have to agree, as they now do for `""`.
+        let mut form = empty_form::<Contact>().expect("no enum fields, so nothing to choose");
+        form.apply(&applied(&[("name", "Ada")]));
+        assert_eq!(form.validate(), Some(contact(None)));
+    }
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember"]
+    fn filling_in_an_absent_optional_struct_makes_it_present() {
+        // `present` is DERIVED, never asked: the user typing into the inner
+        // inputs is what makes the container `Some`. No third construction
+        // question, and no "is there an address?" checkbox.
+        let mut form = form_for(&contact(None));
+        form.apply(&applied(&[
+            ("address.street", "123 Main St"),
+            ("address.city", "Springfield"),
+            ("address.zip", "12345"),
+        ]));
+        assert_eq!(form.validate(), Some(contact(Some(springfield()))));
+    }
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember"]
+    fn blanking_a_present_optional_struct_makes_it_absent() {
+        // The inverse, and the same rule one level up from `""` IS absence:
+        // every leaf underneath empty ⟺ the container is absent.
+        let mut form = form_for(&contact(Some(springfield())));
+        form.apply(&applied(&[
+            ("address.street", ""),
+            ("address.city", ""),
+            ("address.zip", ""),
+        ]));
+        assert_eq!(form.validate(), Some(contact(None)));
+    }
+
+    #[test]
+    fn a_partly_filled_optional_struct_is_an_error() {
+        // Green today, but only vacuously — everything under an `Option<Struct>`
+        // is required right now, so *any* partial fill errors. Its real job is
+        // as a live guard while the decorator lands: absent has to mean EVERY
+        // leaf empty, so a wrapper that treats "some leaf empty" as absent (and
+        // quietly drops the street the user typed) fails here.
+        //
+        // Falls straight out of the two rules above: some leaf is non-empty, so
+        // the container is present, so its inner *required* fields are required
+        // again. "Optional" is about the whole address, not about each line of
+        // it — a street with no city is a half-answered address, not an absent
+        // one.
+        let mut form = form_for(&contact(None));
+        form.apply(&applied(&[("address.street", "123 Main St")]));
+        assert_eq!(form.validate(), None);
+        assert!(form.has_errors());
+    }
+
+    // ── Option<Vec<T>> ──
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember — `init_list` on the Option slot today"]
+    fn a_present_optional_list_round_trips() {
+        let value = Tagged {
             tags: Some(vec!["x".to_string()]),
         };
-        let mut form = form_for(&tagged);
-        assert_eq!(form.validate(), Some(tagged));
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
+    }
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember"]
+    fn an_absent_optional_list_round_trips() {
+        let value = Tagged { tags: None };
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
+    }
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember — and CONFIRM the semantics, see comment"]
+    fn an_empty_optional_list_collapses_to_absent() {
+        // DESIGN QUESTION, not a settled rule. `Some(vec![])` has no leaves at
+        // all, so "absent ⟺ every leaf underneath is empty" is vacuously true
+        // and it comes back as `None` — the exact analogue of `Some("")`
+        // collapsing to `None`, and unrepresentable in the DOM for the same
+        // reason (a zero-row list submits nothing).
+        //
+        // It may not survive create-mode lengths (VEC_PLAN step 4), where a
+        // caller could legitimately ask for a present, zero-row list. If that
+        // wins, flip this test to expect `Some(vec![])` and derive presence from
+        // the *length choice* rather than from emptiness.
+        let mut form = form_for(&Tagged {
+            tags: Some(Vec::new()),
+        });
+        assert_eq!(form.validate(), Some(Tagged { tags: None }));
+    }
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember"]
+    fn an_optional_list_of_structs_round_trips() {
+        // Three frames deep on the write path — `begin_some` → `init_list` →
+        // `begin_list_item` → `begin_field` — which is where a decorator that
+        // forwards `write_into` instead of `write_value_into` comes apart.
+        let value = Roster {
+            members: Some(vec![springfield()]),
+        };
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
+    }
+
+    // ── Composition ──
+
+    #[test]
+    #[ignore = "RED: needs option_member/OptionalMember"]
+    fn option_peels_one_layer_at_a_time() {
+        // `Option<Vec<Option<String>>>` →
+        // `OptionalMember(ListSet(rows of OptionalMember(FormField)))`, each
+        // layer contributing exactly one frame. Row 1 is empty, so it's `None`
+        // by the same rule that makes the whole list present: some leaf under
+        // `cells` is non-empty.
+        let value = Matrix {
+            cells: Some(vec![Some("a".to_string()), None]),
+        };
+        let form = form_for(&value);
+        assert_eq!(paths(&form), vec!["cells.0", "cells.1"]);
+
+        let mut form = form;
+        assert_eq!(form.validate(), Some(value));
     }
 }
 
