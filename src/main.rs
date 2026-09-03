@@ -647,6 +647,19 @@ where
 {
     match peek {
         None => FieldValue::Empty,
+        // `""` IS absence, and that has to hold at BOTH boundaries. `apply_leaves`
+        // already collapses an empty input to `Empty`; without the same collapse
+        // here, seeding kept `Some("")` alive and `leaves() -> apply()` silently
+        // stopped being an identity — the very invariant the uncontrolled design
+        // rests on. Comparing the *display* string is what makes the two agree
+        // exactly, since that's the string `raw_value` would have emitted.
+        //
+        // Only `String` can actually reach this: `true`/`0`/`0.0` are never empty.
+        // The cost is that a required `String` holding `""` can't round-trip — but
+        // that's HTML5's rule, not ours (an empty required input is `valueMissing`),
+        // so no browser form could round-trip it either. Failing the same way on
+        // both paths beats depending on which path the value arrived through.
+        Some(p) if p.to_string().is_empty() => FieldValue::Empty,
         Some(p) => FieldValue::Valid(
             p.get::<X>()
                 .expect("scalar_type matched, so this get is the right type")
@@ -2245,5 +2258,127 @@ mod vec_tests {
         };
         let mut form = form_for(&tagged);
         assert_eq!(form.validate(), Some(tagged));
+    }
+}
+
+/// `""` is absence — the rule that makes `leaves() -> apply()` an identity.
+///
+/// The DOM cannot express `Some("")`: HTML5 constraint validation treats an
+/// empty input as `valueMissing`, so a `required` field rejects it and an
+/// optional one submits nothing distinguishable from "untouched". `apply_leaves`
+/// has always honored that. These pin the *other* boundary — seeding — to the
+/// same rule, so a value behaves identically whichever path it arrives through.
+#[cfg(test)]
+mod empty_string_tests {
+    use super::*;
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Optional {
+        body: Option<String>,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Required {
+        body: String,
+    }
+
+    /// Push a form's own leaves back through the widget boundary and revalidate —
+    /// the path a real submit takes, as opposed to validating the seeded form.
+    fn through_the_dom<T>(form: &Form<T>, mut reloaded: Form<T>) -> Option<T>
+    where
+        T: Clone + Debug + PartialEq + Facet<'static>,
+    {
+        let collected: HashMap<String, String> = form.leaves().into_iter().collect();
+        reloaded.apply(&collected);
+        reloaded.validate()
+    }
+
+    #[test]
+    fn seeding_some_empty_collapses_to_none() {
+        // Regression: seeding used to keep `Valid("")` here, so this returned
+        // `Some("")` while the DOM path returned `None` for the same model.
+        let mut form = form_for(&Optional {
+            body: Some(String::new()),
+        });
+        assert_eq!(form.validate(), Some(Optional { body: None }));
+    }
+
+    #[test]
+    fn some_empty_agrees_on_both_paths() {
+        let value = Optional {
+            body: Some(String::new()),
+        };
+        let form = form_for(&value);
+        let seeded = form_for(&value).validate();
+        let dom = through_the_dom(&form, empty_form::<Optional>().expect("no enums"));
+
+        assert_eq!(seeded, dom);
+        assert_eq!(seeded, Some(Optional { body: None }));
+    }
+
+    #[test]
+    fn a_required_empty_string_fails_on_both_paths() {
+        // The genuine cost of the rule, made explicit: a model holding `""` in a
+        // required field can't round-trip. That's HTML5's constraint, not ours —
+        // and it now fails the same way whichever path it takes, instead of
+        // passing when seeded and erroring through the DOM.
+        let value = Required {
+            body: String::new(),
+        };
+        let form = form_for(&value);
+        let seeded = form_for(&value).validate();
+        let dom = through_the_dom(&form, empty_form::<Required>().expect("no enums"));
+
+        assert_eq!(seeded, None);
+        assert_eq!(dom, None);
+    }
+
+    #[test]
+    fn none_and_some_empty_are_indistinguishable() {
+        // Both directions of the same coin: seeding `None` and seeding `Some("")`
+        // produce the same form, so nothing downstream can tell them apart.
+        let from_none = form_for(&Optional { body: None });
+        let from_empty = form_for(&Optional {
+            body: Some(String::new()),
+        });
+        assert_eq!(from_none.leaves(), from_empty.leaves());
+    }
+
+    #[test]
+    fn non_empty_strings_are_untouched() {
+        // Guard on the collapse: it must catch `""` and nothing else. A string of
+        // spaces is a real value — trimming is a validator's job, not seeding's.
+        let value = Optional {
+            body: Some("   ".to_string()),
+        };
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
+
+        let value = Required {
+            body: "hello".to_string(),
+        };
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
+    }
+
+    #[test]
+    fn zero_valued_scalars_are_not_empty() {
+        // The collapse keys on the *display* string, so it must not swallow
+        // falsy-looking numbers and bools — `0`/`0.0`/`false` all render
+        // non-empty and stay `Valid`.
+        #[derive(Facet, Clone, Debug, PartialEq)]
+        struct Falsy {
+            count: i32,
+            ratio: f64,
+            flag: bool,
+        }
+
+        let value = Falsy {
+            count: 0,
+            ratio: 0.0,
+            flag: false,
+        };
+        let mut form = form_for(&value);
+        assert_eq!(form.validate(), Some(value));
     }
 }
