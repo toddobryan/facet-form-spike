@@ -113,19 +113,93 @@ impl<T: Clone + Debug + PartialEq + Facet<'static>> Form<T> {
     }
 }
 
+/// A caller's answer for one enum path.
+///
+/// Deliberately not a bare `String`: `enum Filter { None, ByDate { .. } }` is a
+/// perfectly ordinary model, so a `"None"` sentinel would make "leave this
+/// optional field empty" indistinguishable from "pick the `None` variant."
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VariantChoice {
+    /// An `Option<Enum>` left empty. Only legal where the enum sits behind an
+    /// `Option` — [`VariantOptions::optional`] says where that is.
+    Absent,
+    /// This variant, by name.
+    Named(String),
+}
+
+/// What a caller may answer for one enum path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantOptions {
+    /// True when the enum sits behind an `Option`, making
+    /// [`VariantChoice::Absent`] a legal answer — a picker should offer a
+    /// "none" entry in addition to the variants.
+    pub optional: bool,
+    /// Variant names, in declaration order.
+    pub variants: Vec<String>,
+}
+
+/// The enum choices a form still needs before it can be built.
+///
+/// The payload is exactly what a variant-picker UI needs — which path, what the
+/// options are, and whether "none" is among them — so handling this error *is*
+/// the create-a-record flow, not defensive boilerplate bolted onto it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingVariants(pub HashMap<String, VariantOptions>);
+
+impl std::fmt::Display for MissingVariants {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut paths: Vec<&String> = self.0.keys().collect();
+        paths.sort();
+        write!(f, "no variant chosen for: ")?;
+        for (i, path) in paths.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            let opts = &self.0[*path];
+            write!(f, "{path} (one of {:?}", opts.variants)?;
+            if opts.optional {
+                write!(f, " or none")?;
+            }
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MissingVariants {}
+
+/// Edit mode. Infallible: the value itself pins every variant, so there is
+/// nothing left for a caller to choose.
 pub fn form_for<T: Clone + Debug + PartialEq + Facet<'static>>(value: &T) -> Form<T> {
     form_for_impl(Some(value), &HashMap::new())
 }
 
-pub fn empty_form<T: Clone + Debug + PartialEq + Facet<'static>>() -> Form<T> {
-    form_for_impl(None, &HashMap::new())
+/// Create mode with no choices supplied — fails with [`MissingVariants`] if `T`
+/// contains any enum at all.
+pub fn empty_form<T: Clone + Debug + PartialEq + Facet<'static>>()
+-> Result<Form<T>, MissingVariants> {
+    empty_form_with_variants(&HashMap::new())
 }
 
-pub fn empty_form_with_variants<T: Clone + Debug + PartialEq + Facet<'static>>(variants: &HashMap<String, String>) -> Form<T> {
-    form_for_impl(None, variants)
+/// Create mode. Returns the still-needed choices rather than panicking, so a
+/// caller can render the next round of pickers and try again — the loop
+/// [`missing_variants`] describes.
+pub fn empty_form_with_variants<T: Clone + Debug + PartialEq + Facet<'static>>(
+    variants: &HashMap<String, VariantChoice>,
+) -> Result<Form<T>, MissingVariants> {
+    let missing = missing_variants::<T>(variants);
+    if !missing.is_empty() {
+        return Err(MissingVariants(missing));
+    }
+    // Every enum reachable under `T` now has a valid choice, so the construction
+    // below can't hit an unchosen one.
+    Ok(form_for_impl(None, variants))
 }
 
-fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<&T>, variants: &HashMap<String, String>) -> Form<T> {
+fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(
+    value: Option<&T>,
+    variants: &HashMap<String, VariantChoice>,
+) -> Form<T> {
     assert!(
         value.is_none() || variants.is_empty(),
         "should be impossible to have Some with non-empty variants"
@@ -143,7 +217,7 @@ fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(value: Option<&T
 fn members_for(
     shape: &'static Shape,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, String>,
+    variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     match &shape.ty {
@@ -158,7 +232,7 @@ fn members_for(
 fn fields_from_struct(
     struct_type: &StructType,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, String>,
+    variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     let peek_struct = peek.map(|p| {
@@ -184,27 +258,52 @@ fn fields_from_struct(
 /// map, keyed by this enum's qualified path. Shared by the top-level
 /// `fields_from_enum` and `member_for`'s enum-field arm (which also needs the
 /// variant's *name*), so the selection logic lives in exactly one place.
+/// `None` means [`VariantChoice::Absent`] — an `Option<Enum>` with no value.
+///
+/// `seeding` is whether we're in edit mode, and it's what disambiguates a
+/// `peek_enum` of `None`: while seeding, that means the value's `Option` really
+/// was `None` (so: absent, no choice needed — this is why edit mode is
+/// infallible even for optional enums). While not seeding, it just means there
+/// is no value at all and the answer comes from the caller's map.
 fn chosen_variant(
     enum_type: &EnumType,
     peek_enum: Option<PeekEnum<'_, 'static>>,
-    variants: &HashMap<String, String>,
+    seeding: bool,
+    variants: &HashMap<String, VariantChoice>,
     prefix: &str,
-) -> &'static Variant {
-    let variant_name: String = match peek_enum {
-        Some(pe) => pe
-            .variant_name_active()
-            .expect("an enum value always has an active variant")
-            .to_string(),
-        None => variants
-            .get(prefix)
-            .unwrap_or_else(|| panic!("no variant chosen for the enum at {prefix:?}"))
-            .clone(),
+) -> Option<&'static Variant> {
+    let variant_name: String = if seeding {
+        match peek_enum {
+            Some(pe) => pe
+                .variant_name_active()
+                .expect("an enum value always has an active variant")
+                .to_string(),
+            // Seeding from a value whose optional enum is `None`.
+            None => return None,
+        }
+    } else {
+        // Unreachable from the public constructors: `empty_form_with_variants`
+        // pre-checks with `missing_variants`, which reports an unanswered path,
+        // one naming a variant this enum doesn't have, and `Absent` where it
+        // isn't legal.
+        match variants.get(prefix) {
+            Some(VariantChoice::Named(name)) => name.clone(),
+            Some(VariantChoice::Absent) => return None,
+            None => panic!(
+                "no variant chosen for the enum at {prefix:?} — missing_variants should have caught this"
+            ),
+        }
     };
-    enum_type
-        .variants
-        .iter()
-        .find(|v| v.name == variant_name)
-        .unwrap_or_else(|| panic!("{variant_name:?} is not a variant of this enum"))
+
+    Some(
+        enum_type
+            .variants
+            .iter()
+            .find(|v| v.name == variant_name)
+            .unwrap_or_else(|| {
+                panic!("{variant_name:?} is not a variant of this enum — missing_variants should have caught this")
+            }),
+    )
 }
 
 /// One member per field of the chosen `variant`, seeded from that variant's
@@ -214,7 +313,7 @@ fn chosen_variant(
 fn variant_members(
     variant: &'static Variant,
     peek_enum: Option<PeekEnum<'_, 'static>>,
-    variants: &HashMap<String, String>,
+    variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     variant
@@ -237,21 +336,22 @@ fn variant_members(
 fn fields_from_enum(
     enum_type: &EnumType,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, String>,
+    variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     let peek_enum = peek.map(|p| {
         p.into_enum()
             .expect("shape said enum, so the value peeks as one")
     });
-    let variant = chosen_variant(enum_type, peek_enum, variants, prefix);
+    let variant = chosen_variant(enum_type, peek_enum, peek.is_some(), variants, prefix)
+        .expect("a top-level enum model is not behind an Option, so it can't be Absent");
     variant_members(variant, peek_enum, variants, prefix)
 }
 
 fn member_for(
     field: &'static Field,
     peek: Option<Peek<'_, 'static>>,
-    variants: &HashMap<String, String>,
+    variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Box<dyn FormMember> {
     // `Option<X>` means optional, and `X` — not `Option<X>` — is what the
@@ -295,43 +395,117 @@ fn member_for(
                 p.into_enum()
                     .expect("shape said enum, so the value peeks as one")
             });
-            let variant = chosen_variant(enum_type, peek_enum, variants, prefix);
+            let variant = chosen_variant(enum_type, peek_enum, peek.is_some(), variants, prefix);
             Box::new(VariantSet {
                 name: field.name.to_string(),
                 label: None,
-                variant: variant.name.to_string(),
-                members: variant_members(variant, peek_enum, variants, prefix),
+                // `None` from `chosen_variant` is exactly `Absent` — either the
+                // caller chose it, or we're seeding from a value whose `Option`
+                // was `None`.
+                choice: match variant {
+                    Some(v) => VariantChoice::Named(v.name.to_string()),
+                    None => VariantChoice::Absent,
+                },
+                optional: !required,
+                // No variant means no fields to build.
+                members: variant
+                    .map(|v| variant_members(v, peek_enum, variants, prefix))
+                    .unwrap_or_default(),
                 errors: Vec::new(),
             })
         }
         other => panic!("field {} has unsupported type {other:?}", field.name),
     }
 }
-/// A map from each enum field's qualified path to that enum's variant names.
-fn required_variants<T: Facet<'static>>() -> HashMap<String, Vec<String>> {
+/// A map from each enum field's qualified path to that enum's variant names,
+/// before any choices have been made. The starting point of the iterative
+/// disclosure loop — see [`missing_variants`].
+fn required_variants<T: Facet<'static>>() -> HashMap<String, VariantOptions> {
+    missing_variants::<T>(&HashMap::new())
+}
+
+/// The enum choices still needed to build a form for `T`, given the choices
+/// already made — keyed by qualified path, valued by that enum's variant names.
+///
+/// **Inherently iterative.** A variant has to be chosen before its fields are
+/// visible at all, so choosing one can reveal *more* enums underneath it that
+/// were unreachable a moment ago. Callers loop: ask, present those pickers,
+/// record the answers, ask again, until this comes back empty. That's why the
+/// naive one-shot walk was wrong — it could only ever see the enums reachable
+/// without making a single choice.
+fn missing_variants<T: Facet<'static>>(
+    chosen: &HashMap<String, VariantChoice>,
+) -> HashMap<String, VariantOptions> {
     // Out-param, not a threaded return: recursion just mutates `out` in place,
-    // so there's no borrow to pass back and forth.
-    fn walk(out: &mut HashMap<String, Vec<String>>, s: &'static Shape, prefix: &str) {
+    // so there's no borrow to pass back and forth. `optional` tracks whether we
+    // just came through an `Option`, which decides whether `Absent` is a legal
+    // answer for the enum we're about to hit.
+    fn walk(
+        out: &mut HashMap<String, VariantOptions>,
+        s: &'static Shape,
+        prefix: &str,
+        chosen: &HashMap<String, VariantChoice>,
+        optional: bool,
+    ) {
+        // `Option<X>` doesn't change the path — `member_for` unwraps it without
+        // qualifying — so look straight through it for enums inside, carrying
+        // the optionality down one level.
+        if let Ok(option_def) = s.def.into_option() {
+            walk(out, option_def.t, prefix, chosen, true);
+            return;
+        }
+
         match &s.ty {
             Type::User(UserType::Struct(st)) => {
+                // Each field's own shape decides its optionality, so it resets.
                 for f in st.fields.iter() {
-                    walk(out, f.shape(), &qualify(prefix, f.name));
+                    walk(out, f.shape(), &qualify(prefix, f.name), chosen, false);
                 }
             }
             Type::User(UserType::Enum(et)) => {
-                out.insert(
-                    prefix.to_string(),
-                    et.variants.iter().map(|v| v.name.to_string()).collect(),
-                );
+                let record = |out: &mut HashMap<String, VariantOptions>| {
+                    out.insert(
+                        prefix.to_string(),
+                        VariantOptions {
+                            optional,
+                            variants: et.variants.iter().map(|v| v.name.to_string()).collect(),
+                        },
+                    );
+                };
+
+                match chosen.get(prefix) {
+                    // Left empty, and legal here: nothing inside to reach, so
+                    // this path is fully answered.
+                    Some(VariantChoice::Absent) if optional => {}
+                    // `Absent` on an enum that isn't behind an `Option` is not a
+                    // real answer — report it as still-needed so the caller sees
+                    // what the actual options are.
+                    Some(VariantChoice::Absent) => record(out),
+                    Some(VariantChoice::Named(name)) => {
+                        match et.variants.iter().find(|v| v.name == *name) {
+                            // Chosen: descend into that variant's own fields,
+                            // which is where newly-revealed enums show up.
+                            Some(variant) => {
+                                for f in variant.data.fields.iter() {
+                                    walk(out, f.shape(), &qualify(prefix, f.name), chosen, false);
+                                }
+                            }
+                            // Named something this enum doesn't have — same
+                            // treatment as unanswered, which hands back the real
+                            // options rather than failing obscurely later.
+                            None => record(out),
+                        }
+                    }
+                    None => record(out),
+                }
             }
-            // Scalars, Option, List, … — nothing to choose, just skip. (Whether to
-            // descend through Option/into variants is one of the open questions.)
+            // Scalars, List, … — nothing to choose here.
             _ => {}
         }
     }
 
     let mut out = HashMap::new();
-    walk(&mut out, T::SHAPE, "");
+    walk(&mut out, T::SHAPE, "", chosen, false);
     out
 }
 
@@ -493,16 +667,21 @@ impl FormMember for FieldSet {
     }
 }
 
-/// An enum-typed field, locked to one variant chosen before the form (per the
+/// An enum-typed field, locked to one answer chosen before the form (per the
 /// design — variant choice is a construction parameter, not an editable field).
-/// It's a `FieldSet` over the chosen variant's fields, plus the variant name so
-/// `write_into` can replay the choice. The variant is NOT a leaf — it never
-/// appears in a path or an input.
+/// For a [`VariantChoice::Named`] answer it's a `FieldSet` over that variant's
+/// fields, plus the name so `write_into` can replay the choice; for
+/// [`VariantChoice::Absent`] it holds no members at all and writes `None`.
+/// The choice itself is NOT a leaf — it never appears in a path or a submitted
+/// value.
 #[derive(Clone, Debug)]
 pub struct VariantSet {
     pub name: String,
     pub label: Option<String>,
-    pub variant: String,
+    pub choice: VariantChoice,
+    /// Whether this enum sits behind an `Option`, which decides both whether
+    /// `Absent` was legal and whether `write_into` needs a `begin_some()` frame.
+    pub optional: bool,
     pub members: Vec<Box<dyn FormMember>>,
     pub errors: Vec<FormError>,
 }
@@ -517,11 +696,29 @@ impl FormMember for VariantSet {
     }
 
     fn render(&self) -> String {
-        self.members
-            .iter()
-            .map(|m| m.render())
-            .collect::<Vec<String>>()
-            .join("\n")
+        match &self.choice {
+            // Visible but inert, so the user can see they chose to leave a value
+            // out rather than the field silently vanishing. `disabled` also means
+            // the browser won't submit it, so `ABSENT_DISPLAY` never round-trips.
+            // This is the one member that renders without being a leaf — and the
+            // natural spot for a `<select>` if variant choice ever goes live.
+            VariantChoice::Absent => {
+                let input = format!(
+                    r#"<input type="text" name="{}" value="{ABSENT_DISPLAY}" disabled>"#,
+                    self.name
+                );
+                match &self.label {
+                    Some(label) => format!("<label>{label} {input}</label>"),
+                    None => input,
+                }
+            }
+            VariantChoice::Named(_) => self
+                .members
+                .iter()
+                .map(|m| m.render())
+                .collect::<Vec<String>>()
+                .join("\n"),
+        }
     }
 
     fn validate(&mut self) {
@@ -540,7 +737,7 @@ impl FormMember for VariantSet {
     }
 
     fn raw_value(&self) -> String {
-        // Not a scalar — the chosen variant is fixed, not an input of its own.
+        // Not a scalar — the choice is fixed, not an input of its own.
         String::new()
     }
 
@@ -560,15 +757,42 @@ impl FormMember for VariantSet {
 
     fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
         let mut partial = partial.begin_field(&self.name)?;
-        // The one thing a plain field set doesn't do: lock in the variant before
-        // writing its fields, so `Partial::build` materializes the right one.
-        partial = partial.select_variant_named(&self.variant)?;
-        for m in self.members.iter() {
-            partial = m.write_into(partial)?;
+        match &self.choice {
+            // `Option`'s `Default` is `None` whatever the inner type is, so this
+            // writes the absent value without ever naming that type — which is
+            // the point, since we only have a runtime `Shape` for it.
+            VariantChoice::Absent => partial = partial.set_default()?,
+            VariantChoice::Named(variant) => {
+                // Behind an `Option`, `begin_field` lands on the `Option` slot,
+                // not the enum inside it — so descend one level first, or
+                // `select_variant_named` looks for the variant among `None`/
+                // `Some` and fails. `begin_some` pushes a frame, hence the
+                // extra `end()` below.
+                if self.optional {
+                    partial = partial.begin_some()?;
+                }
+                // The one thing a plain field set doesn't do: lock in the
+                // variant before writing its fields, so `Partial::build`
+                // materializes the right one.
+                partial = partial.select_variant_named(variant)?;
+                for m in self.members.iter() {
+                    partial = m.write_into(partial)?;
+                }
+                if self.optional {
+                    partial = partial.end()?; // pops begin_some's frame
+                }
+            }
         }
-        partial.end()
+        partial.end() // pops begin_field's frame
     }
 }
+
+/// Shown for an `Option<Enum>` the user chose to leave empty — in the disabled
+/// input below, and (later) as the "none" entry in a variant picker. Display
+/// only: a disabled input isn't submitted, so this never comes back through
+/// `FormData::values()` and can't be mistaken for a value. That's what keeps it
+/// from reintroducing the sentinel problem `VariantChoice` exists to avoid.
+const ABSENT_DISPLAY: &str = "--none--";
 
 /// `("", "title") -> "title"`, `("location", "street") -> "location.street"`.
 fn qualify(prefix: &str, name: &str) -> String {
@@ -770,7 +994,7 @@ mod tests {
 
     #[test]
     fn repeated_struct_types_get_distinct_paths() {
-        let form = empty_form::<Trip>();
+        let form = empty_form::<Trip>().expect("no enum fields, so nothing to choose");
         let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
 
         assert_eq!(
@@ -788,7 +1012,7 @@ mod tests {
 
     #[test]
     fn form_for_none_walks_the_shape_into_empty_members() {
-        let form = empty_form::<EventForCreate>();
+        let form = empty_form::<EventForCreate>().expect("no enum fields, so nothing to choose");
 
         assert_eq!(member_names(&form.members), vec!["title", "location"]);
 
@@ -807,7 +1031,7 @@ mod tests {
 
     #[test]
     fn form_for_none_is_invalid_until_filled() {
-        let mut form = empty_form::<EventForCreate>();
+        let mut form = empty_form::<EventForCreate>().expect("no enum fields, so nothing to choose");
         assert_eq!(form.validate(), None);
         assert!(form.has_errors());
     }
@@ -830,7 +1054,7 @@ mod tests {
 
     #[test]
     fn option_fields_are_not_required() {
-        let mut form = empty_form::<Rsvp>();
+        let mut form = empty_form::<Rsvp>().expect("no enum fields, so nothing to choose");
 
         // `note: Option<String>` is optional, so an empty form only complains
         // about `name` and `guests`.
@@ -880,7 +1104,7 @@ mod tests {
     fn applying_widget_values_round_trips_to_a_model() {
         // The full loop: shape-walk an empty form, take raw strings back in
         // the way a submit handler would, then validate into a model.
-        let mut form = empty_form::<EventForCreate>();
+        let mut form = empty_form::<EventForCreate>().expect("no enum fields, so nothing to choose");
         form.apply(&values(&[
             ("title", "Board Game Night"),
             ("location.street", "123 Main St"),
@@ -904,7 +1128,7 @@ mod tests {
     #[test]
     fn non_string_scalars_parse_through_the_shape_vtable() {
         // `u32` here never touches `FromStr` — facet parses it from the shape.
-        let mut form = empty_form::<Rsvp>();
+        let mut form = empty_form::<Rsvp>().expect("no enum fields, so nothing to choose");
         form.apply(&values(&[
             ("name", "Ada"),
             ("guests", "2"),
@@ -923,7 +1147,7 @@ mod tests {
 
     #[test]
     fn unparseable_input_becomes_invalid_not_a_panic() {
-        let mut form = empty_form::<Rsvp>();
+        let mut form = empty_form::<Rsvp>().expect("no enum fields, so nothing to choose");
         form.apply(&values(&[("name", "Ada"), ("guests", "not a number")]));
 
         assert_eq!(form.validate(), None);
@@ -972,7 +1196,7 @@ mod tests {
         let form = form_for(&rsvp);
         let round_tripped: HashMap<String, String> = form.leaves().into_iter().collect();
 
-        let mut reloaded = empty_form::<Rsvp>();
+        let mut reloaded = empty_form::<Rsvp>().expect("no enum fields, so nothing to choose");
         reloaded.apply(&round_tripped);
 
         assert_eq!(reloaded.validate(), Some(rsvp));
@@ -1112,7 +1336,7 @@ mod widget_tests {
     /// hands the whole form back and we shuffle it into a `Form<T>` once.
     #[component]
     fn UncontrolledEventForm() -> Element {
-        let form = use_hook(|| empty_form::<EventForCreate>());
+        let form = use_hook(|| empty_form::<EventForCreate>().expect("no enum fields, so nothing to choose"));
         let leaves = form.leaves();
 
         rsx! {
@@ -1128,7 +1352,7 @@ mod widget_tests {
                             FormValue::File(_) => None,
                         })
                         .collect();
-                    let mut form = empty_form::<EventForCreate>();
+                    let mut form = empty_form::<EventForCreate>().expect("no enum fields, so nothing to choose");
                     form.apply_form_values(&values);
                     let _model = form.validate();
                 },
@@ -1163,7 +1387,7 @@ mod widget_tests {
             ("location.zip".to_string(), "12345".to_string()),
         ];
 
-        let mut form = empty_form::<EventForCreate>();
+        let mut form = empty_form::<EventForCreate>().expect("no enum fields, so nothing to choose");
         form.apply_form_values(&submitted);
 
         assert_eq!(
@@ -1253,15 +1477,53 @@ mod enum_tests {
         pub drawing: Drawing,
     }
 
-    fn variants(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+    /// An enum behind an `Option` — the case nothing covered until now.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct Sketch {
+        pub name: String,
+        pub shape: Option<Shape>,
+    }
+
+    /// Expected `missing_variants` output for enums NOT behind an `Option`.
+    fn variants(pairs: &[(&str, &[&str])]) -> HashMap<String, VariantOptions> {
+        opt_variants(pairs, false)
+    }
+
+    /// Same, for enums that ARE behind an `Option` — `Absent` is legal, so a
+    /// picker should offer a "none" entry alongside the variants.
+    fn optional_variants(pairs: &[(&str, &[&str])]) -> HashMap<String, VariantOptions> {
+        opt_variants(pairs, true)
+    }
+
+    fn opt_variants(pairs: &[(&str, &[&str])], optional: bool) -> HashMap<String, VariantOptions> {
         pairs
             .iter()
-            .map(|(path, vs)| (path.to_string(), vs.iter().map(|v| v.to_string()).collect()))
+            .map(|(path, vs)| {
+                (
+                    path.to_string(),
+                    VariantOptions {
+                        optional,
+                        variants: vs.iter().map(|v| v.to_string()).collect(),
+                    },
+                )
+            })
             .collect()
     }
 
+    /// Shorthand for building a choice map.
+    fn chose(pairs: &[(&str, VariantChoice)]) -> HashMap<String, VariantChoice> {
+        pairs
+            .iter()
+            .map(|(path, c)| (path.to_string(), c.clone()))
+            .collect()
+    }
+
+    fn named(name: &str) -> VariantChoice {
+        VariantChoice::Named(name.to_string())
+    }
+
     // A struct with no enum fields anywhere has nothing to choose — the empty
-    // map is exactly what makes `empty_form::<T>()` safe for such a `T`.
+    // map is exactly what makes `empty_form::<T>().expect("no enum fields, so nothing to choose")` safe for such a `T`.
     #[test]
     fn no_enum_fields_yields_empty_map() {
         assert_eq!(required_variants::<Location>(), HashMap::new());
@@ -1300,14 +1562,141 @@ mod enum_tests {
         );
     }
 
+    // ── Discovery: optionality and the legality of Absent ──
+
+    // An enum behind an `Option` is reported as optional, so a picker knows to
+    // offer a "none" entry alongside the variants.
+    #[test]
+    fn optional_enum_is_discovered_as_optional() {
+        assert_eq!(
+            required_variants::<Sketch>(),
+            optional_variants(&[("shape", &["Circle", "Rectangle"])]),
+        );
+    }
+
+    // Choosing Absent answers an optional enum completely — nothing is left.
+    #[test]
+    fn absent_satisfies_an_optional_enum() {
+        let chosen = chose(&[("shape", VariantChoice::Absent)]);
+        assert_eq!(missing_variants::<Sketch>(&chosen), HashMap::new());
+    }
+
+    // But Absent is not a real answer for an enum that isn't behind an Option:
+    // it stays reported, so the caller sees the options it actually has.
+    #[test]
+    fn absent_is_rejected_where_the_enum_is_not_optional() {
+        let chosen = chose(&[("shape", VariantChoice::Absent)]);
+        assert_eq!(
+            missing_variants::<Drawing>(&chosen),
+            variants(&[("shape", &["Circle", "Rectangle"])]),
+        );
+    }
+
+    // Naming a variant this enum doesn't have is treated the same as not
+    // answering — which hands back the real options instead of failing later
+    // inside construction.
+    #[test]
+    fn an_unknown_variant_name_reports_the_real_options() {
+        let chosen = chose(&[("shape", named("Triangle"))]);
+        assert_eq!(
+            missing_variants::<Drawing>(&chosen),
+            variants(&[("shape", &["Circle", "Rectangle"])]),
+        );
+    }
+
+    // ── Option<Enum>: currently broken, fixed by the Absent/begin_some work ──
+
+    // KNOWN FAILING (deliberate). `member_for` unwraps the `Option` and builds a
+    // `VariantSet` whose `write_into` does `begin_field("shape")` — landing on the
+    // `Option<Shape>` slot, not the `Shape` inside it — and then asks it for a
+    // variant named "Circle". facet models `Option` as an enum over `None`/`Some`,
+    // so that lookup can't succeed. The fix is `begin_some()` before selecting.
+    #[test]
+    fn edit_mode_round_trips_an_optional_enum() {
+        let sketch = Sketch {
+            name: "Doodle".to_string(),
+            shape: Some(Shape::Circle { radius: 1.5 }),
+        };
+        let mut form = form_for(&sketch);
+        assert_eq!(form.validate(), Some(sketch));
+    }
+
+    // The other half: `None` should round-trip to `None`, with no leaves under
+    // `shape` at all.
+    #[test]
+    fn edit_mode_round_trips_an_absent_optional_enum() {
+        let sketch = Sketch {
+            name: "Doodle".to_string(),
+            shape: None,
+        };
+        let mut form = form_for(&sketch);
+        assert_eq!(form.validate(), Some(sketch));
+    }
+
+    // Create mode, Absent: no leaves under `shape` at all, and validate()
+    // produces `None` for it.
+    #[test]
+    fn create_mode_absent_builds_a_none() {
+        let chosen = chose(&[("shape", VariantChoice::Absent)]);
+        let mut form = empty_form_with_variants::<Sketch>(&chosen)
+            .expect("Absent is a legal answer for an optional enum");
+
+        let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["name"], "Absent contributes no leaves");
+
+        form.apply_form_values(&[("name".to_string(), "Doodle".to_string())]);
+        assert_eq!(
+            form.validate(),
+            Some(Sketch {
+                name: "Doodle".to_string(),
+                shape: None,
+            }),
+        );
+    }
+
+    // Create mode, a chosen variant behind an Option: its fields appear under
+    // the enum's path, and validate() wraps the result in `Some`.
+    #[test]
+    fn create_mode_named_behind_an_option_builds_a_some() {
+        let chosen = chose(&[("shape", named("Circle"))]);
+        let mut form = empty_form_with_variants::<Sketch>(&chosen)
+            .expect("Circle is a variant of Shape");
+
+        form.apply_form_values(&[
+            ("name".to_string(), "Doodle".to_string()),
+            ("shape.radius".to_string(), "2.5".to_string()),
+        ]);
+        assert_eq!(
+            form.validate(),
+            Some(Sketch {
+                name: "Doodle".to_string(),
+                shape: Some(Shape::Circle { radius: 2.5 }),
+            }),
+        );
+    }
+
+    // The absent field is visible but inert, so the user can see they left it
+    // out. Disabled means the browser won't submit it, so ABSENT_DISPLAY never
+    // comes back as a value.
+    #[test]
+    fn absent_renders_a_disabled_placeholder() {
+        let sketch = Sketch {
+            name: "Doodle".to_string(),
+            shape: None,
+        };
+        let html = form_for(&sketch).render();
+        assert!(html.contains(ABSENT_DISPLAY), "html: {html}");
+        assert!(html.contains("disabled"), "html: {html}");
+    }
+
     // ── Construction: the enum field actually round-trips through validate() ──
 
     // Create mode: the caller picks the variant, the chosen variant's fields
     // become leaves under the enum's path, and validate() builds that variant.
     #[test]
     fn empty_form_with_variants_builds_and_validates_the_chosen_variant() {
-        let chosen = HashMap::from([("shape".to_string(), "Circle".to_string())]);
-        let mut form = empty_form_with_variants::<Drawing>(&chosen);
+        let chosen = chose(&[("shape", named("Circle"))]);
+        let mut form = empty_form_with_variants::<Drawing>(&chosen).expect("every enum has a chosen variant");
 
         // Only the chosen variant's field is present, keyed under `shape`.
         let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
