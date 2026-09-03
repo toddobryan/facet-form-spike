@@ -4,31 +4,6 @@ use facet::{
 };
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
-#[derive(Facet, Clone, Debug, PartialEq)]
-pub struct Event {
-    pub id: u32, // server-assigned — not collected by any form field
-    pub title: String,
-    pub location: Location,
-}
-
-/// What a `Form<T>` actually validates into: every field here is genuinely
-/// collected by some `FormMember`, so `Partial::build()` never hits an
-/// uninitialized field. Surreal assigns `id` on create; on edit, the caller
-/// re-attaches the `id` it already had from the original fetch — `Form`
-/// itself never needs to know about it.
-#[derive(Facet, Clone, Debug, PartialEq)]
-pub struct EventForCreate {
-    pub title: String,
-    pub location: Location,
-}
-
-#[derive(Facet, Clone, Debug, PartialEq)]
-pub struct Location {
-    pub street: String,
-    pub city: String,
-    pub zip: String,
-}
-
 #[derive(Clone, Debug)]
 pub struct Form<T: Clone + Debug + Facet<'static>> {
     pub title: Option<String>,
@@ -348,17 +323,35 @@ fn fields_from_enum(
     variant_members(variant, peek_enum, variants, prefix)
 }
 
+/// The member for one declared *field* — the common case, where the name and
+/// shape both come from the field itself.
 fn member_for(
     field: &'static Field,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Box<dyn FormMember> {
+    member_for_shape(field.shape(), field.name, peek, variants, prefix)
+}
+
+/// The member for a shape that is *named separately* from where it came from.
+///
+/// Split out of [`member_for`] because a list element has no [`Field`] and so no
+/// `field.name` — its name is its index (`"0"`, `"1"`, …), supplied by the
+/// enclosing `ListSet`. Everything below is shape-driven and never looked at the
+/// `Field` for anything but those two things, so the split is pure motion.
+fn member_for_shape(
+    shape: &'static Shape,
+    name: &str,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, VariantChoice>,
+    prefix: &str,
+) -> Box<dyn FormMember> {
     // `Option<X>` means optional, and `X` — not `Option<X>` — is what the
     // widget and the seeded value are actually about.
-    let (required, inner_shape) = match field.shape().def.into_option() {
+    let (required, inner_shape) = match shape.def.into_option() {
         Ok(option_def) => (false, option_def.t),
-        Err(_) => (true, field.shape()),
+        Err(_) => (true, shape),
     };
 
     // Unwrap the same level on the value side, so `inner_peek` always lines up
@@ -375,47 +368,168 @@ fn member_for(
     };
 
     if let Some(scalar) = inner_shape.scalar_type() {
-        return scalar_member(scalar, field.name, required, inner_peek).unwrap_or_else(|| {
+        return scalar_member(scalar, name, required, inner_peek).unwrap_or_else(|| {
             panic!(
-                "field {} has scalar type {scalar:?}, which isn't in the built-in widget set",
-                field.name
+                "field {name} has scalar type {scalar:?}, which isn't in the built-in widget set"
             )
         });
+    } else if let Ok(list_def) = inner_shape.def.into_list() {
+        // SEAM: `list_member(_list_def.t, name, inner_peek, variants, prefix)`,
+        // building one row per element via `member_for_shape` with the index as
+        // the row's name. See VEC_PLAN.md.
+        return list_member(list_def.t, name, inner_peek, variants, prefix);
     }
 
     match &inner_shape.ty {
-        Type::User(UserType::Struct(_)) => Box::new(FieldSet {
-            name: field.name.to_string(),
-            label: None,
-            members: members_for(inner_shape, inner_peek, variants, prefix),
-            errors: Vec::new(),
-        }),
-        Type::User(UserType::Enum(enum_type)) => {
-            let peek_enum = inner_peek.map(|p| {
-                p.into_enum()
-                    .expect("shape said enum, so the value peeks as one")
-            });
-            let variant = chosen_variant(enum_type, peek_enum, peek.is_some(), variants, prefix);
-            Box::new(VariantSet {
-                name: field.name.to_string(),
-                label: None,
-                // `None` from `chosen_variant` is exactly `Absent` — either the
-                // caller chose it, or we're seeding from a value whose `Option`
-                // was `None`.
-                choice: match variant {
-                    Some(v) => VariantChoice::Named(v.name.to_string()),
-                    None => VariantChoice::Absent,
-                },
-                optional: !required,
-                // No variant means no fields to build.
-                members: variant
-                    .map(|v| variant_members(v, peek_enum, variants, prefix))
-                    .unwrap_or_default(),
-                errors: Vec::new(),
-            })
+        Type::User(UserType::Struct(_)) => {
+            struct_member(inner_shape, name, inner_peek, variants, prefix)
         }
-        other => panic!("field {} has unsupported type {other:?}", field.name),
+        Type::User(UserType::Enum(enum_type)) => enum_member(
+            enum_type,
+            name,
+            required,
+            inner_peek,
+            peek.is_some(),
+            variants,
+            prefix,
+        ),
+        other => panic!("field {name} has unsupported type {other:?}"),
     }
+}
+
+/// The closed set of scalar types with a built-in widget. Anything else needs
+/// a custom widget and returns `None` here.
+fn scalar_member(
+    scalar: ScalarType,
+    name: &str,
+    required: bool,
+    peek: Option<Peek<'_, 'static>>,
+) -> Option<Box<dyn FormMember>> {
+    macro_rules! dispatch {
+        ($( $variant:ident => $ty:ty ),* $(,)?) => {
+            match scalar {
+                $(
+                    ScalarType::$variant => Some(Box::new(FormField::<$ty> {
+                        name: name.to_string(),
+                        label: None,
+                        required,
+                        value: seed::<$ty>(peek),
+                        errors: Vec::new(),
+                    }) as Box<dyn FormMember>),
+                )*
+                _ => None,
+            }
+        };
+    }
+
+    dispatch! {
+        String => String,
+        Bool => bool,
+        I8 => i8, I16 => i16, I32 => i32, I64 => i64, ISize => isize,
+        U8 => u8, U16 => u16, U32 => u32, U64 => u64, USize => usize,
+        F32 => f32, F64 => f64,
+    }
+}
+
+/// A list-typed field: a [`ListSet`] whose rows are named by their index, so
+/// the leaf paths (`answer_choices.0.text`) fall out of the same `qualify`
+/// nesting a struct's fields use — no special casing anywhere downstream.
+///
+/// `shape` is the *element* shape (`ListDef::t`), not the `Vec`'s.
+///
+/// Edit mode takes the row count from the value. Create mode has no value to
+/// count, and the length is a construction parameter that isn't plumbed through
+/// yet — see VEC_PLAN.md step 4 — so it yields zero rows for now.
+fn list_member(
+    shape: &'static Shape,
+    name: &str,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, VariantChoice>,
+    prefix: &str,
+) -> Box<dyn FormMember> {
+    let rows = peek
+        .map(|p| {
+            let list = p
+                .into_list()
+                .expect("shape said list, so the value peeks as one");
+            list.iter()
+                .enumerate()
+                .map(|(i, element)| {
+                    // The index IS the row's name, and — unlike `struct_member`,
+                    // which passes `prefix` straight through — nothing upstream
+                    // has qualified it on yet, so do it here. Keeping this in
+                    // step with `collect_leaves` is what keeps the `variants`
+                    // map keys and the leaf paths the same strings.
+                    let row = i.to_string();
+                    member_for_shape(shape, &row, Some(element), variants, &qualify(prefix, &row))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Box::new(ListSet {
+        name: name.to_string(),
+        label: None,
+        rows,
+        errors: Vec::new(),
+    })
+}
+
+
+/// A struct-typed field: a [`FieldSet`] over that struct's own fields, whose
+/// paths accumulate under this field's name.
+fn struct_member(
+    shape: &'static Shape,
+    name: &str,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, VariantChoice>,
+    prefix: &str,
+) -> Box<dyn FormMember> {
+    Box::new(FieldSet {
+        name: name.to_string(),
+        label: None,
+        members: members_for(shape, peek, variants, prefix),
+        errors: Vec::new(),
+    })
+}
+
+/// An enum-typed field: a [`VariantSet`] locked to one already-decided variant.
+///
+/// `seeding` is the *outer* `peek.is_some()` — whether a value was supplied at
+/// all — which is what lets `chosen_variant` tell "this optional enum's value
+/// really was `None`" apart from "no value; consult the chosen-variant map."
+/// It is deliberately not `peek.is_some()` on the unwrapped `peek` below, since
+/// that would conflate the two.
+fn enum_member(
+    enum_type: &EnumType,
+    name: &str,
+    required: bool,
+    peek: Option<Peek<'_, 'static>>,
+    seeding: bool,
+    variants: &HashMap<String, VariantChoice>,
+    prefix: &str,
+) -> Box<dyn FormMember> {
+    let peek_enum = peek.map(|p| {
+        p.into_enum()
+            .expect("shape said enum, so the value peeks as one")
+    });
+    let variant = chosen_variant(enum_type, peek_enum, seeding, variants, prefix);
+    Box::new(VariantSet {
+        name: name.to_string(),
+        label: None,
+        // `None` from `chosen_variant` is exactly `Absent` — either the caller
+        // chose it, or we're seeding from a value whose `Option` was `None`.
+        choice: match variant {
+            Some(v) => VariantChoice::Named(v.name.to_string()),
+            None => VariantChoice::Absent,
+        },
+        optional: !required,
+        // No variant means no fields to build.
+        members: variant
+            .map(|v| variant_members(v, peek_enum, variants, prefix))
+            .unwrap_or_default(),
+        errors: Vec::new(),
+    })
 }
 /// A map from each enum field's qualified path to that enum's variant names,
 /// before any choices have been made. The starting point of the iterative
@@ -509,40 +623,6 @@ fn missing_variants<T: Facet<'static>>(
     out
 }
 
-/// The closed set of scalar types with a built-in widget. Anything else needs
-/// a custom widget and returns `None` here.
-fn scalar_member(
-    scalar: ScalarType,
-    name: &str,
-    required: bool,
-    peek: Option<Peek<'_, 'static>>,
-) -> Option<Box<dyn FormMember>> {
-    macro_rules! dispatch {
-        ($( $variant:ident => $ty:ty ),* $(,)?) => {
-            match scalar {
-                $(
-                    ScalarType::$variant => Some(Box::new(FormField::<$ty> {
-                        name: name.to_string(),
-                        label: None,
-                        required,
-                        value: seed::<$ty>(peek),
-                        errors: Vec::new(),
-                    }) as Box<dyn FormMember>),
-                )*
-                _ => None,
-            }
-        };
-    }
-
-    dispatch! {
-        String => String,
-        Bool => bool,
-        I8 => i8, I16 => i16, I32 => i32, I64 => i64, ISize => isize,
-        U8 => u8, U16 => u16, U32 => u32, U64 => u64, USize => usize,
-        F32 => f32, F64 => f64,
-    }
-}
-
 /// Parse a raw input string into `X` using `X`'s own facet parse vtable —
 /// the runtime equivalent of the `T: FromStr` bound the macro-based version
 /// leaned on.
@@ -594,7 +674,13 @@ pub trait FormMember: Debug {
     fn validate(&mut self);
     fn has_errors(&self) -> bool;
     fn clone_box(&self) -> Box<dyn FormMember>;
-    fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError>;
+    fn write_value_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError>;
+    
+    fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
+        let mut partial = partial.begin_field(&self.name())?;
+        partial = self.write_value_into(partial)?;
+        partial.end()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -658,12 +744,11 @@ impl FormMember for FieldSet {
         }
     }
 
-    fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
-        let mut partial = partial.begin_field(&self.name)?;
+    fn write_value_into<'p>(&self, mut partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
         for m in self.members.iter() {
             partial = m.write_into(partial)?;
         }
-        partial.end()
+        Ok(partial)
     }
 }
 
@@ -755,8 +840,7 @@ impl FormMember for VariantSet {
         }
     }
 
-    fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
-        let mut partial = partial.begin_field(&self.name)?;
+    fn write_value_into<'p>(&self, mut partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
         match &self.choice {
             // `Option`'s `Default` is `None` whatever the inner type is, so this
             // writes the absent value without ever naming that type — which is
@@ -783,7 +867,76 @@ impl FormMember for VariantSet {
                 }
             }
         }
-        partial.end() // pops begin_field's frame
+        Ok(partial)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ListSet {
+    pub name: String,
+    pub label: Option<String>,
+    pub rows: Vec<Box<dyn FormMember>>,
+    pub errors: Vec<FormError>,
+}
+
+impl FormMember for ListSet {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    fn render(&self) -> String {
+        self.rows
+            .iter()
+            .map(|r| r.render())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    fn raw_value(&self) -> String {
+        String::new()
+    }
+
+    fn collect_leaves(&self, prefix: &str, out: &mut Vec<(String, String)>) {
+        let nested = qualify(prefix, &self.name);
+        for r in self.rows.iter() {
+            r.collect_leaves(&nested, out);
+        }
+    }
+
+    fn apply_leaves(&mut self, prefix: &str, values: &HashMap<String, String>) {
+        let nested = qualify(prefix, &self.name);
+        for r in self.rows.iter_mut() {
+            r.apply_leaves(&nested, values);
+        }
+    }
+
+    fn validate(&mut self) {
+        self.errors.clear();
+        for r in self.rows.iter_mut() {
+            r.validate();
+        }
+    }
+
+    fn has_errors(&self) -> bool {
+        !self.errors.is_empty() || self.rows.iter().any(|r| r.has_errors())
+    }
+
+    fn clone_box(&self) -> Box<dyn FormMember> {
+        Box::new(self.clone())
+    }
+
+    fn write_value_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
+        let mut partial = partial.init_list()?;
+        for r in self.rows.iter() {
+            partial = partial.begin_list_item()?;
+            partial = r.write_value_into(partial)?;
+            partial = partial.end()?;
+        }
+        Ok(partial)
     }
 }
 
@@ -889,9 +1042,8 @@ impl<T: Clone + Debug + PartialEq + for<'f> Facet<'f> + 'static> FormMember for 
         !self.errors.is_empty() || matches!(self.value, FieldValue::Invalid { .. })
     }
 
-    fn write_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
-        let mut partial = partial.begin_field(&self.name)?;
-        partial = match (&self.value, self.required) {
+    fn write_value_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
+        let partial = match (&self.value, self.required) {
             (FieldValue::Valid(t), true) => partial.set(t.clone())?,
             // Required-vs-optional was decided from the Model's own shape at
             // construction time (`Def::Option` — see the earlier discussion):
@@ -904,7 +1056,7 @@ impl<T: Clone + Debug + PartialEq + for<'f> Facet<'f> + 'static> FormMember for 
                 unreachable!("write_into should only run after validate() has confirmed no errors")
             }
         };
-        partial.end()
+        Ok(partial)
     }
 }
 
@@ -934,7 +1086,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Location as ModelLocation;
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct Event {
+        pub id: u32, // server-assigned — not collected by any form field
+        pub title: String,
+        pub location: Location,
+    }
+
+    /// What a `Form<T>` actually validates into: every field here is genuinely
+    /// collected by some `FormMember`, so `Partial::build()` never hits an
+    /// uninitialized field. Surreal assigns `id` on create; on edit, the caller
+    /// re-attaches the `id` it already had from the original fetch — `Form`
+    /// itself never needs to know about it.
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct EventForCreate {
+        pub title: String,
+        pub location: Location,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    pub struct Location {
+        pub street: String,
+        pub city: String,
+        pub zip: String,
+    }
 
     fn text_field(name: &str, required: bool, value: FieldValue<String>) -> Box<dyn FormMember> {
         Box::new(FormField {
@@ -1116,7 +1292,7 @@ mod tests {
             form.validate(),
             Some(EventForCreate {
                 title: "Board Game Night".to_string(),
-                location: ModelLocation {
+                location: Location {
                     street: "123 Main St".to_string(),
                     city: "Springfield".to_string(),
                     zip: "12345".to_string(),
@@ -1277,7 +1453,7 @@ mod widget_tests {
     use super::*;
     // `dioxus::prelude` exports its own `Location`, so ours needs an explicit
     // name to win the glob-import ambiguity.
-    use crate::Location as ModelLocation;
+    use super::tests::{EventForCreate, Location as ModelLocation};
     use dioxus::prelude::*;
     use std::collections::HashMap;
 
@@ -1440,6 +1616,7 @@ mod widget_tests {
 #[cfg(test)]
 mod enum_tests {
     use super::*;
+    use super::tests::Location;
 
     // Vec-free enums, per the agreed first target — isolates the enum work from
     // the still-unproven `Vec`/`Def::List` handling. `#[repr(u8)]` is required
@@ -1848,4 +2025,225 @@ mod enum_tests {
     //   3. An enum nested *inside a variant's* fields — does the walk recurse
     //      through variants, and if so what are those paths (they only exist
     //      once a parent variant is chosen)?
+}
+
+/// `Vec` / `Def::List` — edit mode. Rows are members named by their index, so
+/// every path convention here falls out of the same `qualify` nesting a struct's
+/// fields use, with no list-specific code in `collect_leaves`/`apply_leaves`.
+///
+/// Everything below seeds from a value. Create mode is deliberately absent: the
+/// row count isn't in the shape, so it's a construction parameter like an enum's
+/// variant, and it isn't plumbed through yet (VEC_PLAN.md step 4).
+#[cfg(test)]
+mod vec_tests {
+    use super::enum_tests::Shape;
+    use super::tests::Location;
+    use super::*;
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Quiz {
+        title: String,
+        answers: Vec<String>,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Venues {
+        places: Vec<Location>,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Grid {
+        rows: Vec<Vec<String>>,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Drawings {
+        shapes: Vec<Shape>,
+    }
+
+    #[derive(Facet, Clone, Debug, PartialEq)]
+    struct Tagged {
+        tags: Option<Vec<String>>,
+    }
+
+    fn quiz() -> Quiz {
+        Quiz {
+            title: "Unit 1".to_string(),
+            answers: vec!["alpha".to_string(), "beta".to_string()],
+        }
+    }
+
+    fn venues() -> Venues {
+        Venues {
+            places: vec![
+                Location {
+                    street: "123 Main St".to_string(),
+                    city: "Springfield".to_string(),
+                    zip: "12345".to_string(),
+                },
+                Location {
+                    street: "9 Elm".to_string(),
+                    city: "Shelbyville".to_string(),
+                    zip: "99999".to_string(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn scalar_rows_round_trip() {
+        let mut form = form_for(&quiz());
+        assert_eq!(form.validate(), Some(quiz()));
+    }
+
+    #[test]
+    fn an_empty_list_round_trips() {
+        // `init_list` with no `begin_list_item` at all — the degenerate case
+        // that would quietly pass even if seeding were broken, which is why it
+        // can't be the only list test.
+        let empty = Quiz {
+            title: "Unit 1".to_string(),
+            answers: Vec::new(),
+        };
+        let mut form = form_for(&empty);
+        assert_eq!(form.validate(), Some(empty));
+    }
+
+    #[test]
+    fn struct_rows_round_trip() {
+        // The case that proves the `write_value_into` split: a row is a
+        // `FieldSet`, so this nests `begin_list_item` → `begin_field` per struct
+        // field. Confusing the two halves fails exactly here.
+        let mut form = form_for(&venues());
+        assert_eq!(form.validate(), Some(venues()));
+    }
+
+    #[test]
+    fn rows_are_named_by_index() {
+        let form = form_for(&quiz());
+        assert_eq!(
+            form.leaves(),
+            vec![
+                ("title".to_string(), "Unit 1".to_string()),
+                ("answers.0".to_string(), "alpha".to_string()),
+                ("answers.1".to_string(), "beta".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn struct_rows_qualify_through_their_index() {
+        let form = form_for(&venues());
+        let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "places.0.street",
+                "places.0.city",
+                "places.0.zip",
+                "places.1.street",
+                "places.1.city",
+                "places.1.zip",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_lists_nest_their_indices() {
+        let grid = Grid {
+            rows: vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()],
+            ],
+        };
+        let form = form_for(&grid);
+        let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, vec!["rows.0.0", "rows.0.1", "rows.1.0"]);
+
+        let mut form = form;
+        assert_eq!(form.validate(), Some(grid));
+    }
+
+    #[test]
+    fn enum_rows_are_pinned_by_the_value() {
+        // Seeding pins each row's variant independently — row 0 and row 1 are
+        // different variants of the same enum, and neither needed a choice from
+        // the caller because the value itself answered.
+        let drawings = Drawings {
+            shapes: vec![
+                Shape::Circle { radius: 1.5 },
+                Shape::Rectangle {
+                    width: 2.0,
+                    height: 3.0,
+                },
+            ],
+        };
+        let form = form_for(&drawings);
+        let paths: Vec<String> = form.leaves().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            paths,
+            vec!["shapes.0.radius", "shapes.1.width", "shapes.1.height"]
+        );
+
+        let mut form = form;
+        assert_eq!(form.validate(), Some(drawings));
+    }
+
+    #[test]
+    fn editing_one_row_leaves_the_others_alone() {
+        let mut form = form_for(&venues());
+        form.apply(&HashMap::from([(
+            "places.1.city".to_string(),
+            "Ogdenville".to_string(),
+        )]));
+
+        let mut expected = venues();
+        expected.places[1].city = "Ogdenville".to_string();
+        assert_eq!(form.validate(), Some(expected));
+    }
+
+    #[test]
+    fn leaves_then_apply_is_an_identity_round_trip() {
+        // The widget loop, for lists. Note this reloads into a form of the SAME
+        // shape rather than `empty_form` (the way the scalar version of this
+        // test does): create mode yields zero rows today, so an `empty_form`
+        // here would drop every row on the floor. Swap it once step 4 lands —
+        // that substitution is a good check that lengths really are plumbed.
+        let form = form_for(&venues());
+        let collected: HashMap<String, String> = form.leaves().into_iter().collect();
+
+        let mut reloaded = form_for(&venues());
+        reloaded.apply(&collected);
+        assert_eq!(reloaded.validate(), Some(venues()));
+    }
+
+    #[test]
+    fn create_mode_yields_no_rows_yet() {
+        // Characterization, not an endorsement: `list_member` has no length to
+        // work from without a value, so it builds an empty `ListSet` and
+        // `validate` produces `vec![]` with no complaint. This test exists to
+        // make that silence visible, and SHOULD start failing at step 4.
+        let mut form = empty_form::<Quiz>().expect("no enum fields, so nothing to choose");
+        form.apply(&HashMap::from([("title".to_string(), "Unit 1".to_string())]));
+        assert_eq!(
+            form.validate(),
+            Some(Quiz {
+                title: "Unit 1".to_string(),
+                answers: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "known gap: Option<Vec<T>> needs a begin_some frame, like VariantSet's"]
+    fn optional_lists_round_trip() {
+        // `begin_field` lands on the `Option` slot, so `init_list` is called on
+        // `Option<Vec<String>>` and facet rejects it — the exact shape of the
+        // bug `Option<Enum>` had before `VariantSet` grew its `optional` flag.
+        let tagged = Tagged {
+            tags: Some(vec!["x".to_string()]),
+        };
+        let mut form = form_for(&tagged);
+        assert_eq!(form.validate(), Some(tagged));
+    }
 }
