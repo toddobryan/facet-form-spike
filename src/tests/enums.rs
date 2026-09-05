@@ -3,15 +3,7 @@
 use crate::*;
 use facet::Facet;
 use std::collections::HashMap;
-use super::models::{Location, Shape};
-
-// Unit variants — to prove they still enumerate even with no fields.
-#[derive(Facet, Clone, Debug, PartialEq)]
-#[repr(u8)]
-pub enum Mode {
-    Fast,
-    Slow,
-}
+use super::models::{Location, Mode, Shape};
 
 #[derive(Facet, Clone, Debug, PartialEq)]
 pub struct Drawing {
@@ -362,7 +354,7 @@ fn empty_form_with_variants_builds_and_validates_the_chosen_variant() {
     );
 }
 
-// Edit mode: the value pins the variant (no map needed) and seeds its
+// Edit mode: the value pins the variant (no map needed) and populates its
 // fields; validate() replays the same variant via select_variant_named.
 #[test]
 fn form_for_round_trips_an_enum_field() {

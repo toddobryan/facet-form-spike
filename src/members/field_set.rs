@@ -72,4 +72,15 @@ impl FormMember for FieldSet {
         }
         Ok(partial)
     }
+    
+    fn is_present(&self) -> bool {
+        self.members.iter().any(|fm| fm.is_present())
+    }
+    
+    fn clear_errors(&mut self) {
+        self.errors.clear();
+        for m in self.members.iter_mut() {
+            m.clear_errors();
+        }
+    }
 }

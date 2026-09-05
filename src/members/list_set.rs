@@ -73,4 +73,15 @@ impl FormMember for ListSet {
         }
         Ok(partial)
     }
+    
+    fn is_present(&self) -> bool {
+        !self.rows.is_empty() && self.rows.iter().any(|fm| fm.is_present())
+    }
+    
+    fn clear_errors(&mut self) {
+        self.errors.clear();
+        for r in self.rows.iter_mut() {
+            r.clear_errors();
+        }
+    }
 }

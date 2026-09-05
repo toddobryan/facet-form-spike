@@ -6,10 +6,12 @@ use std::{collections::HashMap, fmt::Debug};
 
 mod field_set;
 mod list_set;
+mod option_member;
 mod variant_set;
 
 pub use field_set::FieldSet;
 pub use list_set::ListSet;
+pub use option_member::OptionMember;
 pub use variant_set::VariantSet;
 
 pub trait FormMember: Debug {
@@ -38,6 +40,9 @@ pub trait FormMember: Debug {
         partial = self.write_value_into(partial)?;
         partial.end()
     }
+
+    fn is_present(&self) -> bool;
+    fn clear_errors(&mut self);
 }
 
 impl Clone for Box<dyn FormMember> {

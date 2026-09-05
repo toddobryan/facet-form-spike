@@ -151,14 +151,14 @@ fn component_mints_one_signal_per_leaf() {
 }
 
 #[test]
-fn signals_are_seeded_from_the_model() {
+fn signals_are_populated_from_the_model() {
     let html = render_to_html(EventFormView);
     assert!(
         html.contains("Board Game Night"),
-        "expected the seeded title in:\n{html}"
+        "expected the populated title in:\n{html}"
     );
     assert!(
         html.contains("123 Main St"),
-        "expected the seeded street in:\n{html}"
+        "expected the populated street in:\n{html}"
     );
 }

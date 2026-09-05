@@ -3,7 +3,7 @@
 
 use facet::{Facet, Partial, Peek};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
-use crate::build::members_for;
+use crate::build::{FormMode, members_for};
 use crate::choices::{MissingVariants, VariantChoice, missing_variants};
 use crate::error::FormError;
 use crate::members::FormMember;
@@ -128,9 +128,17 @@ fn form_for_impl<T: Clone + Debug + PartialEq + Facet<'static>>(
         value.is_none() || variants.is_empty(),
         "should be impossible to have Some with non-empty variants"
     );
-     Form {
+    // The mode is fixed HERE, once, by which constructor the caller reached for —
+    // and threaded down untouched. Deriving it further down from whether some
+    // peek happens to be present is the bug `FormMode`'s docs describe.
+    let mode = match value {
+        Some(_) => FormMode::Populated,
+        None => FormMode::Blank,
+    };
+
+    Form {
         title: None,
-        members: members_for(T::SHAPE, value.map(Peek::new), variants, ""),
+        members: members_for(T::SHAPE, value.map(Peek::new), variants, mode, ""),
         errors: Vec::new(),
         _type: PhantomData,
     }

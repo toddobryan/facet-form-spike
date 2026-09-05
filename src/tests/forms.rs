@@ -1,15 +1,14 @@
-//! End-to-end round trips through `Form<T>`: seed, collect, apply, validate.
+//! End-to-end round trips through `Form<T>`: populate, collect, apply, validate.
 
 use crate::*;
 use facet::Facet;
 use std::{collections::HashMap, marker::PhantomData};
 use super::models::{Event, EventForCreate, Location};
 
-fn text_field(name: &str, required: bool, value: FieldValue<String>) -> Box<dyn FormMember> {
+fn text_field(name: &str, value: FieldValue<String>) -> Box<dyn FormMember> {
     Box::new(FormField {
         name: name.to_string(),
         label: None,
-        required,
         value,
         errors: Vec::new(),
     })
@@ -21,9 +20,9 @@ fn location_members(
     zip: FieldValue<String>,
 ) -> Vec<Box<dyn FormMember>> {
     vec![
-        text_field("street", true, street),
-        text_field("city", true, city),
-        text_field("zip", true, zip),
+        text_field("street", street),
+        text_field("city", city),
+        text_field("zip",  zip),
     ]
 }
 
@@ -94,7 +93,7 @@ fn form_for_none_walks_the_shape_into_empty_members() {
             "expected an input for {name} in:\n{rendered}"
         );
     }
-    // Nothing was seeded, so every input is blank.
+    // Nothing was populated, so every input is blank.
     assert!(!rendered.contains(r#"value="Board Game Night""#));
 }
 
@@ -253,7 +252,7 @@ fn blanking_a_field_makes_it_empty_again() {
 
 #[test]
 fn leaves_then_apply_is_an_identity_round_trip() {
-    // The actual widget loop: seed a form from a model, hand the raw
+    // The actual widget loop: populate a form from a model, hand the raw
     // strings to the widget layer, take them straight back, and validate.
     // Nothing edited in between, so this must land on the same model.
     let rsvp = Rsvp {
@@ -276,7 +275,7 @@ fn empty_event_form_is_invalid() {
     let mut form: Form<Event> = Form {
         title: Some("New Event".to_string()),
         members: vec![
-            text_field("title", true, FieldValue::Empty),
+            text_field("title", FieldValue::Empty),
             location_field_set(FieldValue::Empty, FieldValue::Empty, FieldValue::Empty),
         ],
         errors: Vec::new(),
@@ -321,7 +320,6 @@ fn event_for_create_form_round_trips_to_model() {
         members: vec![
             text_field(
                 "title",
-                true,
                 FieldValue::Valid("Board Game Night".to_string()),
             ),
             location_field_set(

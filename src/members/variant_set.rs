@@ -18,9 +18,6 @@ pub struct VariantSet {
     pub name: String,
     pub label: Option<String>,
     pub choice: VariantChoice,
-    /// Whether this enum sits behind an `Option`, which decides both whether
-    /// `Absent` was legal and whether `write_into` needs a `begin_some()` frame.
-    pub optional: bool,
     pub members: Vec<Box<dyn FormMember>>,
     pub errors: Vec<FormError>,
 }
@@ -67,6 +64,13 @@ impl FormMember for VariantSet {
         }
     }
 
+    fn clear_errors(&mut self) {
+        self.errors.clear();
+        for m in self.members.iter_mut() {
+            m.clear_errors();
+        }
+    }
+
     fn clone_box(&self) -> Box<dyn FormMember> {
         Box::new(self.clone())
     }
@@ -87,6 +91,10 @@ impl FormMember for VariantSet {
         }
     }
 
+    fn is_present(&self) -> bool {
+        !matches!(self.choice, VariantChoice::Absent)
+    }
+
     fn apply_leaves(&mut self, prefix: &str, values: &HashMap<String, String>) {
         let nested = qualify(prefix, &self.name);
         for m in self.members.iter_mut() {
@@ -96,19 +104,7 @@ impl FormMember for VariantSet {
 
     fn write_value_into<'p>(&self, mut partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
         match &self.choice {
-            // `Option`'s `Default` is `None` whatever the inner type is, so this
-            // writes the absent value without ever naming that type — which is
-            // the point, since we only have a runtime `Shape` for it.
-            VariantChoice::Absent => partial = partial.set_default()?,
             VariantChoice::Named(variant) => {
-                // Behind an `Option`, `begin_field` lands on the `Option` slot,
-                // not the enum inside it — so descend one level first, or
-                // `select_variant_named` looks for the variant among `None`/
-                // `Some` and fails. `begin_some` pushes a frame, hence the
-                // extra `end()` below.
-                if self.optional {
-                    partial = partial.begin_some()?;
-                }
                 // The one thing a plain field set doesn't do: lock in the
                 // variant before writing its fields, so `Partial::build`
                 // materializes the right one.
@@ -116,10 +112,8 @@ impl FormMember for VariantSet {
                 for m in self.members.iter() {
                     partial = m.write_into(partial)?;
                 }
-                if self.optional {
-                    partial = partial.end()?; // pops begin_some's frame
-                }
             }
+            _ => unreachable!("A VariantChoice::Absent is handled by OtherMember")
         }
         Ok(partial)
     }

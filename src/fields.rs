@@ -17,7 +17,6 @@ pub enum FieldValue<T: Clone + Debug + PartialEq> {
 pub struct FormField<T: Clone + Debug + PartialEq + for<'f> Facet<'f>> {
     pub name: String,
     pub label: Option<String>,
-    pub required: bool,
     pub value: FieldValue<T>,
     pub errors: Vec<FieldError>,
 }
@@ -85,7 +84,7 @@ impl<T: Clone + Debug + PartialEq + for<'f> Facet<'f> + 'static> FormMember for 
 
     fn validate(&mut self) {
         self.errors.clear();
-        if self.required && matches!(self.value, FieldValue::Empty) {
+        if matches!(self.value, FieldValue::Empty) {
             self.errors
                 .push(FieldError("This field is required.".to_string()));
         }
@@ -100,20 +99,24 @@ impl<T: Clone + Debug + PartialEq + for<'f> Facet<'f> + 'static> FormMember for 
     }
 
     fn write_value_into<'p>(&self, partial: Partial<'p>) -> Result<Partial<'p>, ReflectError> {
-        let partial = match (&self.value, self.required) {
-            (FieldValue::Valid(t), true) => partial.set(t.clone())?,
+        let partial = match &self.value {
+            FieldValue::Valid(t) => partial.set(t.clone())?,
             // Required-vs-optional was decided from the Model's own shape at
             // construction time (`Def::Option` — see the earlier discussion):
             // `required == false` means the Model's field is really
             // `Option<T>`, so the value written back has to be wrapped/`None`
             // to match, not the bare `T` the `required` branch writes.
-            (FieldValue::Valid(t), false) => partial.set(Some(t.clone()))?,
-            (FieldValue::Empty, false) => partial.set(None::<T>)?,
-            (FieldValue::Empty, true) | (FieldValue::Invalid { .. }, _) => {
-                unreachable!("write_into should only run after validate() has confirmed no errors")
-            }
+            _ => unreachable!("write_into should only run after validate() has confirmed no errors"),
         };
         Ok(partial)
+    }
+    
+    fn is_present(&self) -> bool {
+        self.value != FieldValue::Empty
+    }
+    
+    fn clear_errors(&mut self) {
+        self.errors.clear();
     }
 }
 
@@ -135,7 +138,7 @@ where
         .map_err(|e| FieldError(e.to_string()))
 }
 
-pub(crate) fn seed<X>(peek: Option<Peek<'_, 'static>>) -> FieldValue<X>
+pub(crate) fn populate<X>(peek: Option<Peek<'_, 'static>>) -> FieldValue<X>
 where
     X: Clone + Debug + PartialEq + for<'f> Facet<'f> + 'static,
 {
@@ -143,7 +146,7 @@ where
         None => FieldValue::Empty,
         // `""` IS absence, and that has to hold at BOTH boundaries. `apply_leaves`
         // already collapses an empty input to `Empty`; without the same collapse
-        // here, seeding kept `Some("")` alive and `leaves() -> apply()` silently
+        // here, populating kept `Some("")` alive and `leaves() -> apply()` silently
         // stopped being an identity — the very invariant the uncontrolled design
         // rests on. Comparing the *display* string is what makes the two agree
         // exactly, since that's the string `raw_value` would have emitted.
@@ -156,7 +159,7 @@ where
         Some(p) if p.to_string().is_empty() => FieldValue::Empty,
         Some(p) => FieldValue::Valid(
             p.get::<X>()
-                .expect("scalar_type matched, so this get is the right type")
+                .expect("scalar_type matched, so this get should be the right type")
                 .clone(),
         ),
     }

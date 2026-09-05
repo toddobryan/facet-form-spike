@@ -37,3 +37,13 @@ pub enum Shape {
     Circle { radius: f64 },
     Rectangle { width: f64, height: f64 },
 }
+
+/// A FIELDLESS enum. Used by `enums` to prove unit variants still enumerate, and
+/// by `optional_containers` because a chosen unit variant contributes NO leaves —
+/// which is what makes presence underivable from leaf contents.
+#[derive(Facet, Clone, Debug, PartialEq)]
+#[repr(u8)]
+pub enum Mode {
+    Fast,
+    Slow,
+}

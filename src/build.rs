@@ -1,25 +1,50 @@
-//! The SHAPE walk: turn a `&'static Shape` (plus an optional value to seed
+//! The SHAPE walk: turn a `&'static Shape` (plus an optional value to populate
 //! from) into a tree of `FormMember`s. One `*_member` helper per kind of thing
 //! a shape can be.
 
-use facet::{EnumType, Field, Peek, PeekEnum, ScalarType, Shape, StructType, Type, UserType, Variant};
+use facet::{EnumType, Field, OptionDef, Peek, PeekEnum, ScalarType, Shape, StructType, Type, UserType, Variant};
 use std::collections::HashMap;
 use crate::choices::VariantChoice;
-use crate::fields::{FormField, seed};
-use crate::members::{FieldSet, FormMember, ListSet, VariantSet, qualify};
+use crate::fields::{FormField, populate};
+use crate::members::{FieldSet, FormMember, ListSet, OptionMember, VariantSet, qualify};
 
-/// One member per declared field of `shape`. `peek` is the value being seeded
+/// Which mode the whole walk is in — fixed at the root by which constructor the
+/// caller reached for, then threaded down unchanged.
+///
+/// **Never recompute this from a local peek.** It was a `seeding: bool` derived
+/// from `peek.is_some()`, which was tautological the moment `option_member`
+/// started peeling one `Option` layer per recursion: the peek it asked about was
+/// the very one it was meant to disambiguate.
+///
+/// Note that [`Populated`](Self::Populated) with no peek at some node is not a
+/// contradiction — it is the whole point. It means "there is a value, and at
+/// this node that value is absent," which is an answer. That is also why the
+/// tempting tightening (`Populated(Peek<'_, 'static>)`) is wrong: it would
+/// outlaw a legal state and re-conflate "nothing here" with "nothing anywhere."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormMode {
+    /// `empty_form*`: no value anywhere. A missing peek means "nothing to populate
+    /// from," and variant choices come from the caller's map.
+    Blank,
+    /// `form_for(&value)`: a missing peek means the value's own `Option` really
+    /// was `None` — absent, and no choice needed. This is what makes edit mode
+    /// infallible even for optional enums.
+    Populated,
+}
+
+/// One member per declared field of `shape`. `peek` is the value being populated
 /// from, if any — it must describe the same shape.
 pub(crate) fn members_for(
     shape: &'static Shape,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     match &shape.ty {
-        Type::User(UserType::Struct(struct_type)) => fields_from_struct(struct_type, peek, variants, prefix),
+        Type::User(UserType::Struct(struct_type)) => fields_from_struct(struct_type, peek, variants, mode, prefix),
         Type::User(UserType::Enum(enum_type)) => {
-            fields_from_enum(enum_type, peek, variants, prefix)
+            fields_from_enum(enum_type, peek, variants, mode, prefix)
         }
         _ => panic!("form_for only handles structs and enums, got {shape}"),
     }
@@ -29,6 +54,7 @@ fn fields_from_struct(
     struct_type: &StructType,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     let peek_struct = peek.map(|p| {
@@ -44,7 +70,7 @@ fn fields_from_struct(
                 ps.field_by_name(field.name)
                     .expect("field came from this shape, so it exists on the value")
             });
-            member_for(field, field_peek, variants, &qualify(prefix, field.name))
+            member_for(field, field_peek, variants, mode, &qualify(prefix, field.name))
         })
         .collect()
 }
@@ -56,25 +82,24 @@ fn fields_from_struct(
 /// variant's *name*), so the selection logic lives in exactly one place.
 /// `None` means [`VariantChoice::Absent`] — an `Option<Enum>` with no value.
 ///
-/// `seeding` is whether we're in edit mode, and it's what disambiguates a
-/// `peek_enum` of `None`: while seeding, that means the value's `Option` really
-/// was `None` (so: absent, no choice needed — this is why edit mode is
-/// infallible even for optional enums). While not seeding, it just means there
-/// is no value at all and the answer comes from the caller's map.
+/// [`FormMode`] is what disambiguates a `peek_enum` of `None`: under
+/// `Populated` it means the value's `Option` really was `None` (absent, no
+/// choice needed); under `Blank` it just means there is no value at all and the
+/// answer comes from the caller's map.
 fn chosen_variant(
     enum_type: &EnumType,
     peek_enum: Option<PeekEnum<'_, 'static>>,
-    seeding: bool,
+    mode: FormMode,
     variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Option<&'static Variant> {
-    let variant_name: String = if seeding {
+    let variant_name: String = if mode == FormMode::Populated {
         match peek_enum {
             Some(pe) => pe
                 .variant_name_active()
                 .expect("an enum value always has an active variant")
                 .to_string(),
-            // Seeding from a value whose optional enum is `None`.
+            // Populating from a value whose optional enum is `None`.
             None => return None,
         }
     } else {
@@ -102,7 +127,7 @@ fn chosen_variant(
     )
 }
 
-/// One member per field of the chosen `variant`, seeded from that variant's
+/// One member per field of the chosen `variant`, populated from that variant's
 /// fields on the value in edit mode. Paths accumulate under this enum's path
 /// just like a struct's fields — the variant name is NOT part of the path
 /// (it's locked; `write_into` replays it via `select_variant_named`).
@@ -110,6 +135,7 @@ fn variant_members(
     variant: &'static Variant,
     peek_enum: Option<PeekEnum<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     variant
@@ -121,7 +147,7 @@ fn variant_members(
                 pe.field_by_name(field.name)
                     .expect("field belongs to the active variant, so access can't error")
             });
-            member_for(field, field_peek, variants, &qualify(prefix, field.name))
+            member_for(field, field_peek, variants, mode, &qualify(prefix, field.name))
         })
         .collect()
 }
@@ -133,15 +159,16 @@ fn fields_from_enum(
     enum_type: &EnumType,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Vec<Box<dyn FormMember>> {
     let peek_enum = peek.map(|p| {
         p.into_enum()
             .expect("shape said enum, so the value peeks as one")
     });
-    let variant = chosen_variant(enum_type, peek_enum, peek.is_some(), variants, prefix)
+    let variant = chosen_variant(enum_type, peek_enum, mode, variants, prefix)
         .expect("a top-level enum model is not behind an Option, so it can't be Absent");
-    variant_members(variant, peek_enum, variants, prefix)
+    variant_members(variant, peek_enum, variants, mode, prefix)
 }
 
 /// The member for one declared *field* — the common case, where the name and
@@ -150,9 +177,10 @@ fn member_for(
     field: &'static Field,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Box<dyn FormMember> {
-    member_for_shape(field.shape(), field.name, peek, variants, prefix)
+    member_for_shape(field.shape(), field.name, peek, variants, mode, prefix)
 }
 
 /// The member for a shape that is *named separately* from where it came from.
@@ -166,64 +194,55 @@ pub(crate) fn member_for_shape(
     name: &str,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Box<dyn FormMember> {
-    // `Option<X>` means optional, and `X` — not `Option<X>` — is what the
-    // widget and the seeded value are actually about.
-    let (required, inner_shape) = match shape.def.into_option() {
-        Ok(option_def) => (false, option_def.t),
-        Err(_) => (true, shape),
-    };
-
-    // Unwrap the same level on the value side, so `inner_peek` always lines up
-    // with `inner_shape`. A `None` here means "nothing to seed from" whether
-    // that's create mode or a genuinely absent optional value — both land on
-    // `FieldValue::Empty`, which is what we want.
-    let inner_peek = match (peek, required) {
-        (None, _) => None,
-        (Some(p), true) => Some(p),
-        (Some(p), false) => p
-            .into_option()
-            .expect("shape said Option, so the value peeks as one")
-            .value(),
-    };
-
-    if let Some(scalar) = inner_shape.scalar_type() {
-        return scalar_member(scalar, name, required, inner_peek).unwrap_or_else(|| {
+    if let Ok(option_def) = shape.def.into_option() {
+        return option_member(option_def, name, peek, variants, mode, prefix);
+    } else if let Some(scalar) = shape.scalar_type() {
+        return scalar_member(scalar, name, peek).unwrap_or_else(|| {
             panic!(
                 "field {name} has scalar type {scalar:?}, which isn't in the built-in widget set"
             )
         });
-    } else if let Ok(list_def) = inner_shape.def.into_list() {
+    } else if let Ok(list_def) = shape.def.into_list() {
         // SEAM: `list_member(_list_def.t, name, inner_peek, variants, prefix)`,
         // building one row per element via `member_for_shape` with the index as
         // the row's name. See VEC_PLAN.md.
-        return list_member(list_def.t, name, inner_peek, variants, prefix);
+        return list_member(list_def.t, name, peek, variants, mode, prefix);
     }
 
-    match &inner_shape.ty {
+    match &shape.ty {
         Type::User(UserType::Struct(_)) => {
-            struct_member(inner_shape, name, inner_peek, variants, prefix)
+            struct_member(shape, name, peek, variants, mode, prefix)
         }
-        Type::User(UserType::Enum(enum_type)) => enum_member(
-            enum_type,
-            name,
-            required,
-            inner_peek,
-            peek.is_some(),
-            variants,
-            prefix,
-        ),
+        Type::User(UserType::Enum(enum_type)) => {
+            enum_member(enum_type, name, peek, mode, variants, prefix)
+        }
         other => panic!("field {name} has unsupported type {other:?}"),
     }
 }
+
+fn option_member(
+    option_def: OptionDef,
+    name: &str,
+    peek: Option<Peek<'_, 'static>>,
+    variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
+    prefix: &str,
+) -> Box<dyn FormMember> {
+    let inner_peek = peek.and_then(|p| {
+        p.into_option().expect("shape said Option, so the value should peek as one").value()
+    });
+    let inner = member_for_shape(option_def.t, name, inner_peek, variants, mode, prefix);
+    Box::new(OptionMember { inner })
+} 
 
 /// The closed set of scalar types with a built-in widget. Anything else needs
 /// a custom widget and returns `None` here.
 fn scalar_member(
     scalar: ScalarType,
     name: &str,
-    required: bool,
     peek: Option<Peek<'_, 'static>>,
 ) -> Option<Box<dyn FormMember>> {
     macro_rules! dispatch {
@@ -233,12 +252,11 @@ fn scalar_member(
                     ScalarType::$variant => Some(Box::new(FormField::<$ty> {
                         name: name.to_string(),
                         label: None,
-                        required,
-                        value: seed::<$ty>(peek),
+                        value: populate::<$ty>(peek),
                         errors: Vec::new(),
                     }) as Box<dyn FormMember>),
                 )*
-                _ => None,
+                _ => None
             }
         };
     }
@@ -266,6 +284,7 @@ fn list_member(
     name: &str,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Box<dyn FormMember> {
     let rows = peek
@@ -282,7 +301,7 @@ fn list_member(
                     // step with `collect_leaves` is what keeps the `variants`
                     // map keys and the leaf paths the same strings.
                     let row = i.to_string();
-                    member_for_shape(shape, &row, Some(element), variants, &qualify(prefix, &row))
+                    member_for_shape(shape, &row, Some(element), variants, mode, &qualify(prefix, &row))
                 })
                 .collect()
         })
@@ -303,29 +322,26 @@ fn struct_member(
     name: &str,
     peek: Option<Peek<'_, 'static>>,
     variants: &HashMap<String, VariantChoice>,
+    mode: FormMode,
     prefix: &str,
 ) -> Box<dyn FormMember> {
     Box::new(FieldSet {
         name: name.to_string(),
         label: None,
-        members: members_for(shape, peek, variants, prefix),
+        members: members_for(shape, peek, variants, mode, prefix),
         errors: Vec::new(),
     })
 }
 
 /// An enum-typed field: a [`VariantSet`] locked to one already-decided variant.
 ///
-/// `seeding` is the *outer* `peek.is_some()` — whether a value was supplied at
-/// all — which is what lets `chosen_variant` tell "this optional enum's value
-/// really was `None`" apart from "no value; consult the chosen-variant map."
-/// It is deliberately not `peek.is_some()` on the unwrapped `peek` below, since
-/// that would conflate the two.
+/// [`FormMode`] comes from the root, not from `peek` — see its docs for why
+/// deriving it here was the bug that made absent optional enums panic.
 fn enum_member(
     enum_type: &EnumType,
     name: &str,
-    required: bool,
     peek: Option<Peek<'_, 'static>>,
-    seeding: bool,
+    mode: FormMode,
     variants: &HashMap<String, VariantChoice>,
     prefix: &str,
 ) -> Box<dyn FormMember> {
@@ -333,20 +349,18 @@ fn enum_member(
         p.into_enum()
             .expect("shape said enum, so the value peeks as one")
     });
-    let variant = chosen_variant(enum_type, peek_enum, seeding, variants, prefix);
+    let variant = chosen_variant(enum_type, peek_enum, mode, variants, prefix);
     Box::new(VariantSet {
         name: name.to_string(),
         label: None,
-        // `None` from `chosen_variant` is exactly `Absent` — either the caller
-        // chose it, or we're seeding from a value whose `Option` was `None`.
+        // `None` from `chosen_variant` is exactly `Absent` — the caller chose it
         choice: match variant {
             Some(v) => VariantChoice::Named(v.name.to_string()),
             None => VariantChoice::Absent,
         },
-        optional: !required,
         // No variant means no fields to build.
         members: variant
-            .map(|v| variant_members(v, peek_enum, variants, prefix))
+            .map(|v| variant_members(v, peek_enum, variants, mode, prefix))
             .unwrap_or_default(),
         errors: Vec::new(),
     })

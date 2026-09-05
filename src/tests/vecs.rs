@@ -59,7 +59,7 @@ fn scalar_rows_round_trip() {
 #[test]
 fn an_empty_list_round_trips() {
     // `init_list` with no `begin_list_item` at all — the degenerate case
-    // that would quietly pass even if seeding were broken, which is why it
+    // that would quietly pass even if populating were broken, which is why it
     // can't be the only list test.
     let empty = Quiz {
         title: "Unit 1".to_string(),
@@ -126,7 +126,7 @@ fn nested_lists_nest_their_indices() {
 
 #[test]
 fn enum_rows_are_pinned_by_the_value() {
-    // Seeding pins each row's variant independently — row 0 and row 1 are
+    // Populating pins each row's variant independently — row 0 and row 1 are
     // different variants of the same enum, and neither needed a choice from
     // the caller because the value itself answered.
     let drawings = Drawings {

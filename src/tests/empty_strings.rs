@@ -15,7 +15,7 @@ struct Required {
 }
 
 /// Push a form's own leaves back through the widget boundary and revalidate —
-/// the path a real submit takes, as opposed to validating the seeded form.
+/// the path a real submit takes, as opposed to validating the populated form.
 fn through_the_dom<T>(form: &Form<T>, mut reloaded: Form<T>) -> Option<T>
 where
     T: Clone + Debug + PartialEq + Facet<'static>,
@@ -26,8 +26,8 @@ where
 }
 
 #[test]
-fn seeding_some_empty_collapses_to_none() {
-    // Regression: seeding used to keep `Valid("")` here, so this returned
+fn populating_some_empty_collapses_to_none() {
+    // Regression: populating used to keep `Valid("")` here, so this returned
     // `Some("")` while the DOM path returned `None` for the same model.
     let mut form = form_for(&Optional {
         body: Some(String::new()),
@@ -41,11 +41,11 @@ fn some_empty_agrees_on_both_paths() {
         body: Some(String::new()),
     };
     let form = form_for(&value);
-    let seeded = form_for(&value).validate();
+    let populated = form_for(&value).validate();
     let dom = through_the_dom(&form, empty_form::<Optional>().expect("no enums"));
 
-    assert_eq!(seeded, dom);
-    assert_eq!(seeded, Some(Optional { body: None }));
+    assert_eq!(populated, dom);
+    assert_eq!(populated, Some(Optional { body: None }));
 }
 
 #[test]
@@ -53,21 +53,21 @@ fn a_required_empty_string_fails_on_both_paths() {
     // The genuine cost of the rule, made explicit: a model holding `""` in a
     // required field can't round-trip. That's HTML5's constraint, not ours —
     // and it now fails the same way whichever path it takes, instead of
-    // passing when seeded and erroring through the DOM.
+    // passing when populated and erroring through the DOM.
     let value = Required {
         body: String::new(),
     };
     let form = form_for(&value);
-    let seeded = form_for(&value).validate();
+    let populated = form_for(&value).validate();
     let dom = through_the_dom(&form, empty_form::<Required>().expect("no enums"));
 
-    assert_eq!(seeded, None);
+    assert_eq!(populated, None);
     assert_eq!(dom, None);
 }
 
 #[test]
 fn none_and_some_empty_are_indistinguishable() {
-    // Both directions of the same coin: seeding `None` and seeding `Some("")`
+    // Both directions of the same coin: populating with `None` and `Some("")`
     // produce the same form, so nothing downstream can tell them apart.
     let from_none = form_for(&Optional { body: None });
     let from_empty = form_for(&Optional {
@@ -79,7 +79,7 @@ fn none_and_some_empty_are_indistinguishable() {
 #[test]
 fn non_empty_strings_are_untouched() {
     // Guard on the collapse: it must catch `""` and nothing else. A string of
-    // spaces is a real value — trimming is a validator's job, not seeding's.
+    // spaces is a real value — trimming is a validator's job, not populating's.
     let value = Optional {
         body: Some("   ".to_string()),
     };
