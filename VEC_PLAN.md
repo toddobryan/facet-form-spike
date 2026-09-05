@@ -166,6 +166,40 @@ natural flow.
    it, and `FormDataError` appears. This is where `MissingVariants` and the
    disclosure loop can be deleted, with `enum_tests` as the net.
 4. **The reactive select**, widget layer only. `Form`/`FormMember` stay plain
-   data — signals live at the widget boundary, per the standing decision.
+   data — signals live at the widget boundary, per the standing decision. See
+   "Warning before a destructive switch" below for what the select does on change.
 5. **`Question`** — the actual motivating case, now with no construction
    questions at all.
+
+## Warning before a destructive switch
+
+Changing a populated variant wipes that subtree, so the select must warn — but
+**only when there is actually something to lose.** An unconditional "you will
+lose your data" on an untouched form trains people to click through it.
+
+`is_present()` already answers exactly this question, and it was added for
+`OptionMember`, so this is a second consumer of it rather than new machinery.
+The crate compiles clean for `wasm32-unknown-unknown` (verified 2026-09-05,
+facet reflection included), so it could run client-side.
+
+**The trap: the in-memory `Form` is STALE at that moment.** Under the
+uncontrolled design the DOM holds everything the user typed and nothing has been
+shuffled back, so `subtree.is_present()` on the `Form` reports "empty" while the
+user stares at a filled-in form. Anything asking the `Form` must collect from the
+DOM first — the same collect → rebuild → re-apply step "add a row" needs.
+
+**Decision (Todd, 2026-09-05): scan the DOM directly, first.** Ask whether any
+input under the prefix (`data.`) has a non-empty value. No collect step, no
+reflection, no staleness. Keep `is_present()` as the authority for the cases
+where the `Form` is already in sync.
+
+This is only sound because **`$variant` is itself an input**. A naive DOM scan
+would otherwise miss a chosen *fieldless* nested variant — precisely the hole
+that caused the `is_present` data-loss bug, since such a variant contributes no
+leaves. With the variant in the DOM, `data.sub.$variant = "Fast"` is a non-empty
+value the scan sees, so the DOM answer and the `is_present()` answer agree rather
+than the DOM one being a lossy approximation. If `$variant` ever stops being a
+real input, this shortcut silently goes wrong.
+
+"Wipe the subtree" is then one sentence: drop every input under the prefix, and
+rebuild from the newly chosen variant.
