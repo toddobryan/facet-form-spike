@@ -1,205 +1,133 @@
-# Plan: create mode, reactive rows, and variants-as-data
+# Plan: Form as schema, Store as live values
 
-Supersedes the original `Vec`/`Def::List` plan (written 2026-09-02), whose steps
-1–3 are done. Rewritten 2026-09-05 against `786b899` (68 tests green).
+Decided 2026-09-05 against `ac09b6c` (74 tests green), after prototyping.
+Supersedes two earlier drafts of this file; what they got wrong is recorded
+under "Roads not taken", because that reasoning is the expensive part.
 Temporary — this file dies with the spike when it folds into `crates/formoxus`.
 
-## Where things stand
+## The architecture
 
-Done: edit-mode lists (rows named by index, `write_value_into` split), nested
-`Vec<Vec<T>>`, `Vec<Enum>`, and optional containers (`OptionMember` peeling one
-`Option` layer per recursion). What is left is **create mode** — and Todd's
-reframe below turns that from "a third construction question" into something
-smaller and more uniform.
+Two things, with clearly separated jobs:
 
-## The reframe: the DOM is the source of truth for STRUCTURE, not just values
+| | holds | changes | reactivity |
+|---|---|---|---|
+| `Form<T>` | members, structure, typed values, errors | rarely — only on a **structural** edit | `Signal<Form<T>>`, coarse |
+| `Store<HashMap<String, String>>` | live edited raw strings, keyed by qualified path | on every keystroke | per-path, fine-grained |
 
-Today, names are derived from structure, one way: the shape decides the paths,
-`collect_leaves` emits them, `apply_leaves` looks them up. The uncontrolled
-design already trusts the DOM for *values* on submit.
+`Form<T>` is **unchanged** — plain data, `FieldValue::Valid(T)` still typed,
+serializable, testable with no Dioxus runtime. Signals stay at the widget
+boundary; a `Store` wraps plain data rather than putting signals inside it.
 
-The observation is that the naming convention is **lossless**, so structure is
-recoverable from names too. `answer_choices.0.text` says "field `text`, of row 0,
-of list `answer_choices`". So on submit we can walk `T::SHAPE` and, at each list,
-count the `prefix.N` keys present rather than being told the length up front.
+**This is what makes the split work:** typing and structural change are
+different operations, on different clocks. Typing is a store write that dirties
+one path. Adding a row or switching a variant is a schema rebuild — discrete,
+rare, and already the collect → rebuild → re-apply move.
 
-That kills the "row count is a construction parameter" premise of the old plan.
+### Verified, not assumed
 
-### Lengths
+Prototyped in `scratchpad/storeproto` (3 tests, all passing):
 
-- **Blank forms default to 1 row**, not 0. Zero rows gives the user nothing to
-  type into and no hint the list exists. (leptos_form reaches the same place from
-  the other direction: `VecConfigSize::Bounded { min: Some(1) }` pads up to the
-  minimum at render.)
-- A caller may still pass an initial count, but it is a **render hint, not a
-  structural commitment** — nothing downstream depends on it being right.
-- **Sparse on the wire, compacted on read.** Deleting the middle of three rows
-  leaves `answers.0`, `answers.2`; renumbering live DOM is the fragile thing we
-  avoid. Count the distinct indices present, take them in order, rebuild densely.
-  Growth is index-stable (row *n*'s paths never move when *n+1* appears), which
-  is what makes a purely-DOM "add row" safe in the first place.
+1. `Store<HashMap<String,String>>::get(path)` yields a child store addressed by a
+   **runtime** string. The original objection — `#[derive(Store)]` generates
+   *named* accessors, impossible for `Vec<Box<dyn FormMember>>` — was about the
+   derive, not the store.
+2. Inputs bind to per-path child stores (`value` + `oninput`).
+3. **Writing one path re-renders only that leaf.** This is the objection that
+   sent us uncontrolled ("we'd have to recreate the entire struct every time any
+   input changes"). It cannot be passing by accident: the child props are
+   identical across the write, so prop memoization would suppress *every*
+   re-render — only the store subscription can mark that one leaf dirty.
 
-### Variants (Todd's idea, and the bigger half)
+Also verified: the whole crate, facet reflection included, compiles for
+`wasm32-unknown-unknown`.
 
-A **reactive `<select>` per enum field**: pick a variant, that subtree's fields
-appear. The choice is then written into the DOM under a marker segment that
-**cannot collide with a Rust field name**, e.g.
+### Lifecycle
 
 ```
-data.$variant = "MultipleChoice"
-data.answer_choices.0.text = "..."
+build      form_for(&model)  or  blank_form::<T>()          -> Form<T>
+seed       form.leaves().into_iter().collect()              -> Store<HashMap<..>>
+type       values.get(path).set(s)                          // one leaf re-renders
+submit     form.apply(&values.read()); form.validate()      -> Option<T>
 ```
 
-`$` is not valid in a Rust identifier and is fine in an HTML `name`, so there is
-no sentinel problem — this is the same trick that already lets integer segments
-(`answers.0`) coexist with field names. For an `Option<Enum>` left empty, the
-select's value is `""`, reusing "`""` IS absence" rather than inventing a second
-convention.
+**Structural edits keep the value map.** It is keyed by path, and paths are
+stable under growth — row *n*'s paths never move when *n+1* appears. So adding a
+row inserts new keys and leaves existing values untouched. Switching a variant
+drops the keys under that prefix and rebuilds the subtree.
 
-## What this retires
+### Destructive-switch warning
 
-If the variant round-trips as data, it stops being a construction parameter, and
-the whole apparatus built around *asking* for it goes away:
+"Would switching this variant lose work?" is now just: **does any key under this
+prefix have a non-empty value?** No DOM query, no staleness, no dependence on a
+`$variant` marker being a real input. "Wipe the subtree" is: drop those keys.
 
-- `MissingVariants`, `VariantOptions`, `missing_variants`, `required_variants`
-- the iterative disclosure loop
-- **the invariant that has bitten us twice**: "pre-flight empty ⟺ construction
-  succeeds", which required the pre-flight walk and the construction walk to
-  agree about what to descend into
+This supersedes the DOM-scan decision from earlier today, which existed only
+because the in-memory `Form` was stale under the uncontrolled design. With the
+store holding live values, nothing is stale.
 
-`VariantChoice` survives as the *state* a `VariantSet` holds; it just arrives
-from the DOM instead of from the caller.
+## What still has to be built
 
-The constructor set collapses to three, one per genuine mode:
+1. **`blank_form::<T>()` with a default of 1 row per list**, not 0. Zero rows
+   gives the user nothing to type into and no hint the list is there.
+2. **Rebuild-with-changed-structure**, preserving the value map: add a row,
+   remove a row, switch a variant. One entry point, since all three are the same
+   operation on the schema.
+3. **An `Unchosen` variant state**, probably. With a reactive select, choosing is
+   something the user does *in* the form, so `blank_form` wants to be infallible
+   and start with nothing chosen. That means `VariantChoice` grows a third state
+   distinct from `Absent` ("deliberately none"), and `validate()` reports an
+   unchosen variant as an error like any other. **If that lands, `MissingVariants`
+   / `VariantOptions` / `missing_variants` / `required_variants` and the whole
+   iterative disclosure loop retire** — along with the "pre-flight empty ⟺
+   construction succeeds" invariant that has bitten us twice.
+4. **The widget layer**: per-path child stores, the reactive `<select>`, and
+   add/remove row buttons.
+5. **`Question`** — the motivating case, and the first real test of all of it.
 
-```rust
-form_for(&value)                    -> Form<T>                    // edit; infallible
-blank_form::<T>()                   -> Form<T>                    // initial render; infallible
-form_from_values::<T>(&values)      -> Result<Form<T>, FormDataError>  // rebuild from a submission
-```
+Row counts and variants are back to being properties of the schema. That is fine
+now in a way it wasn't before: changing them is cheap and lossless, because the
+value map survives.
 
-`empty_form` / `empty_form_with_variants` both disappear. Note `blank_form`
-becomes **infallible** — the reason it returned a `Result` was precisely the
-unchosen-variant problem.
+## Roads not taken
 
-## Reading back is fallible — and that is new
+**Fully uncontrolled, DOM as the source of truth.** What we had. Values live in
+the browser and come back via `FormData::values()` on submit. Gives up live
+validation, conditional fields, and reading state mid-edit. Still *works* — the
+existing tests keep it honest — but the store version is strictly more capable at
+no cost to the data model, and the moment the variant select became reactive the
+"no signals at all" premise was already spent.
 
-`apply` is infallible today: unknown keys are ignored, bad values become
-`FieldValue::Invalid` and stay attached to their field. That works because
-structure is fixed and only *values* come from the wire.
+**Recovering structure from submitted names** (`answers.0`, `answers.2` → count
+the indices; `data.$variant` → the variant). Genuinely workable, and the naming
+convention really is lossless. Dropped because with values in a store, the DOM is
+no longer the source of truth for *anything*: the Form owns structure, the store
+owns values, and neither needs to be reconstructed from name parsing. It also
+made reading fallible in a new way (unknown variant, missing marker, malformed
+path — failures with no field to attach to) and turned submitted names into a
+trust boundary. Worth remembering if a non-Dioxus/plain-HTML target ever matters,
+since it needs no client-side state at all.
 
-Once structure comes from the wire, there are failures with **no field to attach
-themselves to**. Todd's point, and it needs its own error type:
-
-```rust
-pub enum FormDataError {
-    /// `data.$variant = "Nonsense"` — not a variant of that enum.
-    UnknownVariant { path: String, found: String, expected: Vec<String> },
-    /// Fields present under an enum path, but no `$variant` marker.
-    MissingVariant { path: String },
-    /// `$variant` empty on an enum that is NOT behind an `Option`.
-    IllegalAbsence { path: String },
-    /// A path segment where an index was expected but wasn't an integer.
-    MalformedPath { path: String },
-}
-```
-
-Collect these rather than failing fast, matching how field errors already
-accumulate in place rather than short-circuiting.
-
-Worth being explicit that this is a **trust boundary**: submitted names are now
-structural instructions, so every one of these is reachable from a hostile or
-merely stale client, not just from our own bugs.
-
-## Does this reverse the "lock the variant" decision?
-
-Partly, deliberately, and the original reasoning does not forbid it.
-
-That decision (2026-09-02) had two parts. The first — *"no blank form before a
-variant is picked"* — was justified by "it eliminates the reactivity
-requirement." Reactivity for the enum select is now accepted, so that
-justification is spent, and the UX it was protecting (don't let users type into a
-form whose shape is undecided) is preserved anyway: with no variant chosen, the
-subtree renders as just the select.
-
-The second — *"no changing the variant once displayed"* — was justified by data
-loss being ill-posed (a half-filled `TrueFalse` has no coherent `MultipleChoice`
-representation). **That argument still stands**, and it now becomes an explicit UX
-rule rather than a structural guarantee: changing the select **wipes that
-subtree**, and the user should be warned. Adding a *new* row to a `Vec<Enum>` is
-not a change — it is a new sub-form, and "add question → which type?" is a
-natural flow.
-
-## Add/remove a row, by kind
-
-- `Vec<Scalar>` / `Vec<Struct>` — **pure DOM**. Clone a row template, bump the
-  index. No Rust round trip.
-- `Vec<Enum>` — needs a Rust rebuild, because a new row's members don't exist
-  until its variant is answered. That is the collect → rebuild → re-apply trick,
-  on a discrete action, which is exactly what it is for.
+**Raw-canonical `FieldValue::Valid(String)`.** Considered as the prerequisite for
+lensing *into* `Form` with `SelectorScope::hash_child`. Unnecessary — the values
+live beside the Form, not inside it, so no lens into `Form` is needed. Also
+actively worse: `Valid(T)` keeps `form_for(&m).validate() == Some(m)` true **by
+construction**, never passing through a string. Raw-canonical would convert that
+structural guarantee into a dependency on `T -> String -> T` fidelity, which is
+now pinned by `tests/roundtrip.rs` for built-in scalars but can never be enforced
+for a user's custom type.
 
 ## Open questions
 
-1. **Infer the row count, or emit an explicit hidden `answers.$len`?** Django
-   refuses to infer and ships a `TOTAL_FORMS` counter. Inference needs no extra
-   name and matches "the DOM is the truth on submit"; an explicit count is
-   unambiguous against truncated or hostile submissions. Currently leaning
-   inference, but this is the one worth prototyping both ways.
-2. **Does `$variant` become a leaf?** If it shows up in `collect_leaves`, then a
-   chosen fieldless variant finally *does* have a leaf — which would have
-   prevented the `is_present` data-loss bug. Keep the per-kind `is_present`
-   regardless (it is more honest), but the interaction is worth understanding
-   rather than tripping over.
-3. **`OptionMember` and `$variant` both express absence.** For `Option<Enum>`,
-   an empty select and "no leaves under here" must not disagree.
-4. **Does `Form<T>` still need `T` at all** once construction is data-driven?
-   Probably yes — `Partial::alloc::<T>()`/`materialize::<T>()` still need it.
-
-## Suggested order
-
-1. **Lengths first, no reactivity.** `list_member` builds N rows in `Blank` mode,
-   defaulting to 1. Keeps everything green and is a prerequisite for the rest.
-2. **Count rows from submitted names** — `form_from_values`, sparse→compacted,
-   with `Vec<Scalar>` and `Vec<Struct>` tests. Still no enums, so still
-   infallible in practice.
-3. **`$variant` in the DOM**, read side first: `form_from_values` learns to read
-   it, and `FormDataError` appears. This is where `MissingVariants` and the
-   disclosure loop can be deleted, with `enum_tests` as the net.
-4. **The reactive select**, widget layer only. `Form`/`FormMember` stay plain
-   data — signals live at the widget boundary, per the standing decision. See
-   "Warning before a destructive switch" below for what the select does on change.
-5. **`Question`** — the actual motivating case, now with no construction
-   questions at all.
-
-## Warning before a destructive switch
-
-Changing a populated variant wipes that subtree, so the select must warn — but
-**only when there is actually something to lose.** An unconditional "you will
-lose your data" on an untouched form trains people to click through it.
-
-`is_present()` already answers exactly this question, and it was added for
-`OptionMember`, so this is a second consumer of it rather than new machinery.
-The crate compiles clean for `wasm32-unknown-unknown` (verified 2026-09-05,
-facet reflection included), so it could run client-side.
-
-**The trap: the in-memory `Form` is STALE at that moment.** Under the
-uncontrolled design the DOM holds everything the user typed and nothing has been
-shuffled back, so `subtree.is_present()` on the `Form` reports "empty" while the
-user stares at a filled-in form. Anything asking the `Form` must collect from the
-DOM first — the same collect → rebuild → re-apply step "add a row" needs.
-
-**Decision (Todd, 2026-09-05): scan the DOM directly, first.** Ask whether any
-input under the prefix (`data.`) has a non-empty value. No collect step, no
-reflection, no staleness. Keep `is_present()` as the authority for the cases
-where the `Form` is already in sync.
-
-This is only sound because **`$variant` is itself an input**. A naive DOM scan
-would otherwise miss a chosen *fieldless* nested variant — precisely the hole
-that caused the `is_present` data-loss bug, since such a variant contributes no
-leaves. With the variant in the DOM, `data.sub.$variant = "Fast"` is a non-empty
-value the scan sees, so the DOM answer and the `is_present()` answer agree rather
-than the DOM one being a lossy approximation. If `$variant` ever stops being a
-real input, this shortcut silently goes wrong.
-
-"Wipe the subtree" is then one sentence: drop every input under the prefix, and
-rebuild from the newly chosen variant.
+1. **Where does the value map live relative to the `Form`?** Two hooks side by
+   side, or one wrapper type owning both? A wrapper can keep them from drifting
+   (a rebuilt schema with a stale map is the obvious bug) at the cost of putting
+   a `Store` next to plain data.
+2. **Does the map keep stale keys after a shrink?** Removing a row leaves
+   `answers.2.*` behind. Harmless for `apply` (unknown keys are ignored) but it
+   leaks, and it makes "is anything under this prefix non-empty?" answer wrong.
+   Probably prune on rebuild.
+3. **Server-side rendering / no-JS.** The uncontrolled path needed no client
+   state; this one does. Does that matter for this app? Probably not, but it is
+   the thing the road-not-taken buys.
+4. **Does `Form<T>` still need `T`?** Yes — `Partial::alloc::<T>()` and
+   `materialize::<T>()` still need a concrete type.
